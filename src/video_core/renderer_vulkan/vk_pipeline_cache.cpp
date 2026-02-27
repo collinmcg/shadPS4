@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ranges>
+#include <chrono>
+#include <cstdlib>
 
 #include "common/config.h"
 #include "common/hash.h"
@@ -226,6 +228,23 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+    // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
+    // switch used to align metrics/logging and staged rollout experiments.
+    async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
+    async_pso_nonblock = std::getenv("SHADPS4_VK_PSO_NONBLOCK") != nullptr;
+    if (const char* workers = std::getenv("SHADPS4_VK_PSO_WORKERS")) {
+        async_pso_workers = std::max(1, std::atoi(workers));
+    }
+    if (const char* budget = std::getenv("SHADPS4_VK_PSO_BUDGET_US")) {
+        async_pso_soft_budget_us = std::max(500, std::atoi(budget));
+    }
+    if (async_pso_requested) {
+        compile_queue = std::make_unique<PipelineCompileQueue>(async_pso_workers);
+        compile_queue->Start();
+        LOG_INFO(Render_Vulkan,
+                 "SHADPS4_VK_PSO_ASYNC enabled: queue started (workers={}, budget_us={}, sync fallback active)",
+                 async_pso_workers, async_pso_soft_budget_us);
+    }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
@@ -281,21 +300,113 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    if (compile_queue) {
+        compile_queue->Stop();
+    }
+}
+
+void PipelineCache::SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state) {
+    std::scoped_lock lk{build_state_mutex};
+    graphics_build_states[key] = state;
+}
+
+void PipelineCache::LogStagedAsyncSnapshot(std::string_view reason) const {
+    LOG_INFO(Render_Vulkan,
+             "Async PSO snapshot [{}]: g_miss={} c_miss={} g_compile={} c_compile={} "
+             "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={}",
+             reason, perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
+             perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
+             perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
+             perf_counters.async_queue_depth_peak, perf_counters.async_queue_tasks_completed,
+             perf_counters.async_queue_enqueue_skips, perf_counters.async_queue_budget_warnings);
+}
+
+void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state) {
+    std::scoped_lock lk{build_state_mutex};
+    compute_build_states[key] = state;
+}
+
+PipelineCache::PipelineBuildState PipelineCache::GetGraphicsBuildState(
+    const GraphicsPipelineKey& key) const {
+    std::scoped_lock lk{build_state_mutex};
+    const auto it = graphics_build_states.find(key);
+    return it == graphics_build_states.end() ? PipelineBuildState::Missing : it->second;
+}
+
+PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
+    const ComputePipelineKey& key) const {
+    std::scoped_lock lk{build_state_mutex};
+    const auto it = compute_build_states.find(key);
+    return it == compute_build_states.end() ? PipelineBuildState::Missing : it->second;
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    if (async_pso_requested && async_pso_nonblock &&
+        GetGraphicsBuildState(graphics_key) == PipelineBuildState::Compiling) {
+        // Staged non-blocking path: skip this draw call pipeline fetch while compile is in-flight.
+        return nullptr;
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        ++perf_counters.graphics_cache_misses;
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        if (async_pso_requested) {
+            ++perf_counters.graphics_async_queue_hits;
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
+            if (compile_queue) {
+                const auto depth_before = compile_queue->QueueDepth();
+                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                    ++perf_counters.async_queue_enqueue_skips;
+                    ++perf_counters.async_queue_budget_warnings;
+                    ++perf_counters.graphics_sync_fallbacks;
+                } else {
+                    const auto hash_for_task = pipeline_hash;
+                    const auto budget_us = async_pso_soft_budget_us;
+                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        // Placeholder task for staged async rollout instrumentation.
+                        (void)hash_for_task;
+                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - t0)
+                                            .count();
+                        (void)budget_us;
+                        (void)dt;
+                    });
+                }
+                perf_counters.async_queue_depth_peak =
+                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
+                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+            }
+        }
+
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto t0 = std::chrono::steady_clock::now();
+        if (async_pso_requested) {
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
+            ++perf_counters.graphics_sync_fallbacks;
+        }
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++perf_counters.graphics_compile_count;
+        perf_counters.graphics_compile_time_us += static_cast<u64>(dt);
+        if (async_pso_requested) {
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Ready);
+            const u64 total_compiles =
+                perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
+            if ((total_compiles % 128) == 0) {
+                LogStagedAsyncSnapshot("graphics_compile_periodic");
+            }
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -317,15 +428,69 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+    if (async_pso_requested && async_pso_nonblock &&
+        GetComputeBuildState(compute_key) == PipelineBuildState::Compiling) {
+        // Staged non-blocking path: skip this dispatch pipeline fetch while compile is in-flight.
+        return nullptr;
+    }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        ++perf_counters.compute_cache_misses;
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
+        if (async_pso_requested) {
+            ++perf_counters.compute_async_queue_hits;
+            SetComputeBuildState(compute_key, PipelineBuildState::Queued);
+            if (compile_queue) {
+                const auto depth_before = compile_queue->QueueDepth();
+                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                    ++perf_counters.async_queue_enqueue_skips;
+                    ++perf_counters.async_queue_budget_warnings;
+                    ++perf_counters.compute_sync_fallbacks;
+                } else {
+                    const auto hash_for_task = pipeline_hash;
+                    const auto budget_us = async_pso_soft_budget_us;
+                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        // Placeholder task for staged async rollout instrumentation.
+                        (void)hash_for_task;
+                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - t0)
+                                            .count();
+                        (void)budget_us;
+                        (void)dt;
+                    });
+                }
+                perf_counters.async_queue_depth_peak =
+                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
+                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+            }
+        }
+
         ComputePipeline::SerializationSupport sdata{};
+        const auto t0 = std::chrono::steady_clock::now();
+        if (async_pso_requested) {
+            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
+            ++perf_counters.compute_sync_fallbacks;
+        }
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++perf_counters.compute_compile_count;
+        perf_counters.compute_compile_time_us += static_cast<u64>(dt);
+        if (async_pso_requested) {
+            SetComputeBuildState(compute_key, PipelineBuildState::Ready);
+            const u64 total_compiles =
+                perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
+            if ((total_compiles % 128) == 0) {
+                LogStagedAsyncSnapshot("graphics_compile_periodic");
+            }
+        }
+
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

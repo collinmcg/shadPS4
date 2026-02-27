@@ -4,12 +4,15 @@
 #pragma once
 
 #include <variant>
+#include <memory>
+#include <mutex>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 template <>
@@ -65,6 +68,32 @@ struct Program {
 
 class PipelineCache {
 public:
+    enum class PipelineBuildState : u8 {
+        Missing,
+        Queued,
+        Compiling,
+        Ready,
+        Failed,
+    };
+
+    struct PerfCounters {
+        u64 graphics_cache_misses{};
+        u64 compute_cache_misses{};
+        u64 graphics_compile_count{};
+        u64 compute_compile_count{};
+        u64 graphics_compile_time_us{};
+        u64 compute_compile_time_us{};
+        u64 graphics_async_queue_hits{};
+        u64 compute_async_queue_hits{};
+        u64 graphics_sync_fallbacks{};
+        u64 compute_sync_fallbacks{};
+        u64 async_queue_depth_peak{};
+        u64 async_queue_tasks_completed{};
+        u64 async_queue_budget_warnings{};
+        u64 async_queue_enqueue_skips{};
+    };
+
+public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool);
     ~PipelineCache();
@@ -95,10 +124,21 @@ public:
         return profile;
     }
 
+    [[nodiscard]] const PerfCounters& GetPerfCounters() const {
+        return perf_counters;
+    }
+
+    void LogStagedAsyncSnapshot(std::string_view reason) const;
+
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
+
+    void SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state);
+    void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
+    [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
+    [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
@@ -132,6 +172,15 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    PerfCounters perf_counters{};
+    bool async_pso_requested{};
+    bool async_pso_nonblock{};
+    u32 async_pso_workers{1};
+    u32 async_pso_soft_budget_us{2000};
+    std::unique_ptr<PipelineCompileQueue> compile_queue;
+    mutable std::mutex build_state_mutex;
+    tsl::robin_map<GraphicsPipelineKey, PipelineBuildState> graphics_build_states;
+    tsl::robin_map<ComputePipelineKey, PipelineBuildState> compute_build_states;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
