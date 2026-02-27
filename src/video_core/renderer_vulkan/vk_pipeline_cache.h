@@ -4,6 +4,7 @@
 #pragma once
 
 #include <variant>
+#include <memory>
 #include <mutex>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -11,6 +12,7 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 template <>
@@ -164,6 +166,7 @@ private:
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     PerfCounters perf_counters{};
     bool async_pso_requested{};
+    std::unique_ptr<PipelineCompileQueue> compile_queue;
     mutable std::mutex build_state_mutex;
     tsl::robin_map<GraphicsPipelineKey, PipelineBuildState> graphics_build_states;
     tsl::robin_map<ComputePipelineKey, PipelineBuildState> compute_build_states;

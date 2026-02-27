@@ -232,8 +232,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // switch used to align metrics/logging and staged rollout experiments.
     async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
     if (async_pso_requested) {
+        compile_queue = std::make_unique<PipelineCompileQueue>(1);
+        compile_queue->Start();
         LOG_INFO(Render_Vulkan,
-                 "SHADPS4_VK_PSO_ASYNC is set: using sync compile path with perf counters (staged rollout)");
+                 "SHADPS4_VK_PSO_ASYNC is set: compile queue started (sync fallback active for staged rollout)");
     }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -290,7 +292,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    if (compile_queue) {
+        compile_queue->Stop();
+    }
+}
 
 void PipelineCache::SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state) {
     std::scoped_lock lk{build_state_mutex};
@@ -315,6 +321,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         if (async_pso_requested) {
             ++perf_counters.graphics_async_queue_hits;
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
+            if (compile_queue) {
+                const auto hash_for_task = pipeline_hash;
+                compile_queue->Enqueue([hash_for_task] {
+                    // Placeholder task for staged async rollout instrumentation.
+                    (void)hash_for_task;
+                });
+            }
         }
 
         GraphicsPipeline::SerializationSupport sdata{};
@@ -364,6 +377,13 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         if (async_pso_requested) {
             ++perf_counters.compute_async_queue_hits;
             SetComputeBuildState(compute_key, PipelineBuildState::Queued);
+            if (compile_queue) {
+                const auto hash_for_task = pipeline_hash;
+                compile_queue->Enqueue([hash_for_task] {
+                    // Placeholder task for staged async rollout instrumentation.
+                    (void)hash_for_task;
+                });
+            }
         }
 
         ComputePipeline::SerializationSupport sdata{};
