@@ -1,0 +1,34 @@
+name: Windows Test Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'jane/**'
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/windows-test-build.yml'
+
+jobs:
+  windows-build:
+    runs-on: windows-2025
+    env:
+      BUILD_TYPE: Release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadps4-win64-test-${{ github.sha }}
+          path: |
+            ${{github.workspace}}/build/shadPS4.exe
