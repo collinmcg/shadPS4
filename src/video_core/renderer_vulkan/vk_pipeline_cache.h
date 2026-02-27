@@ -6,6 +6,7 @@
 #include <variant>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -84,6 +85,12 @@ public:
         u64 enqueued_ts_us{};
     };
 
+    struct PrewarmEntry {
+        u64 key_hash{};
+        bool is_compute{};
+        u32 priority{};
+    };
+
     struct PerfCounters {
         u64 graphics_cache_misses{};
         u64 compute_cache_misses{};
@@ -153,6 +160,8 @@ private:
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
     [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
     void HandleDeferredCompilePayload(const DeferredCompilePayload& payload, u32 budget_us);
+    void LoadPrewarmManifest();
+    void SchedulePrewarmEntries();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
@@ -192,6 +201,8 @@ private:
     u32 async_pso_workers{1};
     u32 async_pso_soft_budget_us{2000};
     std::unique_ptr<PipelineCompileQueue> compile_queue;
+    std::vector<PrewarmEntry> prewarm_entries;
+    bool prewarm_enabled{};
     mutable std::mutex build_state_mutex;
     tsl::robin_map<GraphicsPipelineKey, PipelineBuildState> graphics_build_states;
     tsl::robin_map<ComputePipelineKey, PipelineBuildState> compute_build_states;
