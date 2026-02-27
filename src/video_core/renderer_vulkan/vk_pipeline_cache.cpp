@@ -353,8 +353,8 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
 
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
-    // PR2 staged hook: payload-aware deferred compile execution scaffold.
-    // Keep this low-risk while validating queue dynamics.
+    // PR3 staged hook: key-aware deferred execution outcome handling.
+    // NOTE: actual Vulkan compile remains on sync fallback path for safety in this PR.
     ++perf_counters.deferred_handler_calls;
     try {
         const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -364,9 +364,38 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
         if (age_us > budget_us) {
             ++perf_counters.deferred_handler_budget_exceeded;
             ++perf_counters.async_queue_budget_warnings;
+            if (payload.is_compute) {
+                if (payload.compute_key) {
+                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+                }
+            } else {
+                if (payload.graphics_key) {
+                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
+                }
+            }
+        } else {
+            // Keep key in queued state until sync fallback build path resolves to Ready.
+            if (payload.is_compute) {
+                if (payload.compute_key) {
+                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Queued);
+                }
+            } else {
+                if (payload.graphics_key) {
+                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Queued);
+                }
+            }
         }
     } catch (...) {
         ++perf_counters.deferred_handler_failures;
+        if (payload.is_compute) {
+            if (payload.compute_key) {
+                SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+            }
+        } else {
+            if (payload.graphics_key) {
+                SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
+            }
+        }
     }
 }
 
@@ -405,6 +434,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                     const DeferredCompilePayload payload{
                         .key_hash = pipeline_hash,
                         .is_compute = false,
+                        .graphics_key = graphics_key,
+                        .compute_key = std::nullopt,
                         .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                              std::chrono::steady_clock::now().time_since_epoch())
                                              .count()),
@@ -494,6 +525,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                     const DeferredCompilePayload payload{
                         .key_hash = pipeline_hash,
                         .is_compute = true,
+                        .graphics_key = std::nullopt,
+                        .compute_key = compute_key,
                         .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                              std::chrono::steady_clock::now().time_since_epoch())
                                              .count()),
