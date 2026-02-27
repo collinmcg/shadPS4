@@ -87,6 +87,8 @@ public:
         u64 compute_async_queue_hits{};
         u64 graphics_sync_fallbacks{};
         u64 compute_sync_fallbacks{};
+        u64 async_queue_depth_peak{};
+        u64 async_queue_tasks_completed{};
     };
 
 public:
@@ -166,6 +168,8 @@ private:
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     PerfCounters perf_counters{};
     bool async_pso_requested{};
+    u32 async_pso_workers{1};
+    u32 async_pso_soft_budget_us{2000};
     std::unique_ptr<PipelineCompileQueue> compile_queue;
     mutable std::mutex build_state_mutex;
     tsl::robin_map<GraphicsPipelineKey, PipelineBuildState> graphics_build_states;

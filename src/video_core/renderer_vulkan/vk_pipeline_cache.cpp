@@ -231,11 +231,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
     // switch used to align metrics/logging and staged rollout experiments.
     async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
+    if (const char* workers = std::getenv("SHADPS4_VK_PSO_WORKERS")) {
+        async_pso_workers = std::max(1, std::atoi(workers));
+    }
+    if (const char* budget = std::getenv("SHADPS4_VK_PSO_BUDGET_US")) {
+        async_pso_soft_budget_us = std::max(500, std::atoi(budget));
+    }
     if (async_pso_requested) {
-        compile_queue = std::make_unique<PipelineCompileQueue>(1);
+        compile_queue = std::make_unique<PipelineCompileQueue>(async_pso_workers);
         compile_queue->Start();
         LOG_INFO(Render_Vulkan,
-                 "SHADPS4_VK_PSO_ASYNC is set: compile queue started (sync fallback active for staged rollout)");
+                 "SHADPS4_VK_PSO_ASYNC enabled: queue started (workers={}, budget_us={}, sync fallback active)",
+                 async_pso_workers, async_pso_soft_budget_us);
     }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -327,6 +334,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                     // Placeholder task for staged async rollout instrumentation.
                     (void)hash_for_task;
                 });
+                perf_counters.async_queue_depth_peak =
+                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
+                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
             }
         }
 
@@ -383,6 +393,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                     // Placeholder task for staged async rollout instrumentation.
                     (void)hash_for_task;
                 });
+                perf_counters.async_queue_depth_peak =
+                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
+                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
             }
         }
 
