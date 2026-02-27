@@ -147,6 +147,7 @@ private:
     [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
     [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
+    void HandleDeferredCompilePayload(const DeferredCompilePayload& payload, u32 budget_us);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);

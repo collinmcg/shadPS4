@@ -348,6 +348,14 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
     return queue_depth >= high_watermark;
 }
 
+void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
+                                                 u32 budget_us) {
+    // PR2 staged hook: payload-aware deferred compile execution will be implemented here.
+    // Keep this no-op for safety until key-specific compile execution is validated.
+    (void)payload;
+    (void)budget_us;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -382,15 +390,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                                              .count()),
                     };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([payload, budget_us] {
-                        const auto t0 = std::chrono::steady_clock::now();
-                        // Placeholder task for staged async rollout instrumentation.
-                        (void)payload;
-                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
-                                            std::chrono::steady_clock::now() - t0)
-                                            .count();
-                        (void)budget_us;
-                        (void)dt;
+                    compile_queue->Enqueue([this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
                     });
                 }
                 perf_counters.async_queue_depth_peak =
@@ -472,15 +473,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                              .count()),
                     };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([payload, budget_us] {
-                        const auto t0 = std::chrono::steady_clock::now();
-                        // Placeholder task for staged async rollout instrumentation.
-                        (void)payload;
-                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
-                                            std::chrono::steady_clock::now() - t0)
-                                            .count();
-                        (void)budget_us;
-                        (void)dt;
+                    compile_queue->Enqueue([this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
                     });
                 }
                 perf_counters.async_queue_depth_peak =
