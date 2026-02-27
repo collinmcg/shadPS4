@@ -231,6 +231,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
     // switch used to align metrics/logging and staged rollout experiments.
     async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
+    async_pso_nonblock = std::getenv("SHADPS4_VK_PSO_NONBLOCK") != nullptr;
     if (const char* workers = std::getenv("SHADPS4_VK_PSO_WORKERS")) {
         async_pso_workers = std::max(1, std::atoi(workers));
     }
@@ -315,8 +316,27 @@ void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, Pipeline
     compute_build_states[key] = state;
 }
 
+PipelineCache::PipelineBuildState PipelineCache::GetGraphicsBuildState(
+    const GraphicsPipelineKey& key) const {
+    std::scoped_lock lk{build_state_mutex};
+    const auto it = graphics_build_states.find(key);
+    return it == graphics_build_states.end() ? PipelineBuildState::Missing : it->second;
+}
+
+PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
+    const ComputePipelineKey& key) const {
+    std::scoped_lock lk{build_state_mutex};
+    const auto it = compute_build_states.find(key);
+    return it == compute_build_states.end() ? PipelineBuildState::Missing : it->second;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
+        return nullptr;
+    }
+    if (async_pso_requested && async_pso_nonblock &&
+        GetGraphicsBuildState(graphics_key) == PipelineBuildState::Compiling) {
+        // Staged non-blocking path: skip this draw call pipeline fetch while compile is in-flight.
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -403,6 +423,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
+        return nullptr;
+    }
+    if (async_pso_requested && async_pso_nonblock &&
+        GetComputeBuildState(compute_key) == PipelineBuildState::Compiling) {
+        // Staged non-blocking path: skip this dispatch pipeline fetch while compile is in-flight.
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);

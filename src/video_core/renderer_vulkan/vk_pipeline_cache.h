@@ -135,6 +135,8 @@ private:
 
     void SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state);
     void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
+    [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
+    [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
@@ -170,6 +172,7 @@ private:
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     PerfCounters perf_counters{};
     bool async_pso_requested{};
+    bool async_pso_nonblock{};
     u32 async_pso_workers{1};
     u32 async_pso_soft_budget_us{2000};
     std::unique_ptr<PipelineCompileQueue> compile_queue;
