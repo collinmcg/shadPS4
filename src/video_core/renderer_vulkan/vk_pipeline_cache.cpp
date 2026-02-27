@@ -230,7 +230,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
     // switch used to align metrics/logging and staged rollout experiments.
-    const bool async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
+    async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
     if (async_pso_requested) {
         LOG_INFO(Render_Vulkan,
                  "SHADPS4_VK_PSO_ASYNC is set: using sync compile path with perf counters (staged rollout)");
@@ -292,6 +292,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
+void PipelineCache::SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state) {
+    std::scoped_lock lk{build_state_mutex};
+    graphics_build_states[key] = state;
+}
+
+void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state) {
+    std::scoped_lock lk{build_state_mutex};
+    compute_build_states[key] = state;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -302,8 +312,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        if (async_pso_requested) {
+            ++perf_counters.graphics_async_queue_hits;
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
+        }
+
         GraphicsPipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
+        if (async_pso_requested) {
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
+            ++perf_counters.graphics_sync_fallbacks;
+        }
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
@@ -312,6 +331,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                             .count();
         ++perf_counters.graphics_compile_count;
         perf_counters.graphics_compile_time_us += static_cast<u64>(dt);
+        if (async_pso_requested) {
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Ready);
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -339,8 +361,17 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
+        if (async_pso_requested) {
+            ++perf_counters.compute_async_queue_hits;
+            SetComputeBuildState(compute_key, PipelineBuildState::Queued);
+        }
+
         ComputePipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
+        if (async_pso_requested) {
+            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
+            ++perf_counters.compute_sync_fallbacks;
+        }
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
@@ -349,6 +380,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                             .count();
         ++perf_counters.compute_compile_count;
         perf_counters.compute_compile_time_us += static_cast<u64>(dt);
+        if (async_pso_requested) {
+            SetComputeBuildState(compute_key, PipelineBuildState::Ready);
+        }
 
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;

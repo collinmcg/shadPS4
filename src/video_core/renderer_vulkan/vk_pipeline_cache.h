@@ -4,6 +4,7 @@
 #pragma once
 
 #include <variant>
+#include <mutex>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -65,6 +66,14 @@ struct Program {
 
 class PipelineCache {
 public:
+    enum class PipelineBuildState : u8 {
+        Missing,
+        Queued,
+        Compiling,
+        Ready,
+        Failed,
+    };
+
     struct PerfCounters {
         u64 graphics_cache_misses{};
         u64 compute_cache_misses{};
@@ -72,6 +81,10 @@ public:
         u64 compute_compile_count{};
         u64 graphics_compile_time_us{};
         u64 compute_compile_time_us{};
+        u64 graphics_async_queue_hits{};
+        u64 compute_async_queue_hits{};
+        u64 graphics_sync_fallbacks{};
+        u64 compute_sync_fallbacks{};
     };
 
 public:
@@ -114,6 +127,9 @@ private:
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
+    void SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state);
+    void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
+
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
@@ -147,6 +163,10 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     PerfCounters perf_counters{};
+    bool async_pso_requested{};
+    mutable std::mutex build_state_mutex;
+    tsl::robin_map<GraphicsPipelineKey, PipelineBuildState> graphics_build_states;
+    tsl::robin_map<ComputePipelineKey, PipelineBuildState> compute_build_states;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
