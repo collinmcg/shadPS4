@@ -356,6 +356,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         perf_counters.graphics_compile_time_us += static_cast<u64>(dt);
         if (async_pso_requested) {
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Ready);
+            const u64 total_compiles =
+                perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
+            if ((total_compiles % 128) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Async PSO staged stats: g_miss={} c_miss={} g_compile={} c_compile={} "
+                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={}",
+                         perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
+                         perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
+                         perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
+                         perf_counters.async_queue_depth_peak,
+                         perf_counters.async_queue_tasks_completed);
+            }
         }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
@@ -415,6 +427,18 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         perf_counters.compute_compile_time_us += static_cast<u64>(dt);
         if (async_pso_requested) {
             SetComputeBuildState(compute_key, PipelineBuildState::Ready);
+            const u64 total_compiles =
+                perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
+            if ((total_compiles % 128) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Async PSO staged stats: g_miss={} c_miss={} g_compile={} c_compile={} "
+                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={}",
+                         perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
+                         perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
+                         perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
+                         perf_counters.async_queue_depth_peak,
+                         perf_counters.async_queue_tasks_completed);
+            }
         }
 
         RegisterPipelineData(compute_key, sdata);
