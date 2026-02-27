@@ -76,6 +76,12 @@ public:
         Failed,
     };
 
+    struct DeferredCompilePayload {
+        u64 key_hash{};
+        bool is_compute{};
+        u64 enqueued_ts_us{};
+    };
+
     struct PerfCounters {
         u64 graphics_cache_misses{};
         u64 compute_cache_misses{};
@@ -91,6 +97,10 @@ public:
         u64 async_queue_tasks_completed{};
         u64 async_queue_budget_warnings{};
         u64 async_queue_enqueue_skips{};
+        u64 async_throttle_hits{};
+        u64 deferred_handler_calls{};
+        u64 deferred_handler_budget_exceeded{};
+        u64 deferred_handler_failures{};
     };
 
 public:
@@ -139,6 +149,8 @@ private:
     void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
     [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
+    [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
+    void HandleDeferredCompilePayload(const DeferredCompilePayload& payload, u32 budget_us);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
