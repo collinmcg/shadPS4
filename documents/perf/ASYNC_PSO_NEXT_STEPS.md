@@ -7,7 +7,7 @@
 
 ## Next code slices
 1. Key-specific deferred compile payloads in queue tasks.
-2. Non-blocking retrieval path when key state is `Compiling`.
+2. ✅ Non-blocking retrieval path when key state is `Compiling` (flag: `SHADPS4_VK_PSO_NONBLOCK`).
 3. Frame-budget aware sync fallback policy.
 4. Optional title prewarm manifest loader.
 

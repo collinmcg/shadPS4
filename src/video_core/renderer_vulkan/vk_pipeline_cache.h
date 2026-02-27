@@ -128,6 +128,8 @@ public:
         return perf_counters;
     }
 
+    void LogStagedAsyncSnapshot(std::string_view reason) const;
+
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();

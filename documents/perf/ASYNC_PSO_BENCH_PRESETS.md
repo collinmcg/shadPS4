@@ -12,16 +12,28 @@ unset SHADPS4_VK_PSO_BUDGET_US
 ## Preset B: Staged async telemetry (safe)
 ```bash
 export SHADPS4_VK_PSO_ASYNC=1
+unset SHADPS4_VK_PSO_NONBLOCK
 export SHADPS4_VK_PSO_WORKERS=1
 export SHADPS4_VK_PSO_BUDGET_US=2000
 ```
 
-## Preset C: Aggressive staging
+## Preset C: Aggressive staging (still sync fallback)
 ```bash
 export SHADPS4_VK_PSO_ASYNC=1
+unset SHADPS4_VK_PSO_NONBLOCK
 export SHADPS4_VK_PSO_WORKERS=2
 export SHADPS4_VK_PSO_BUDGET_US=3500
 ```
+
+## Preset D: Experimental non-blocking fetch checks
+```bash
+export SHADPS4_VK_PSO_ASYNC=1
+export SHADPS4_VK_PSO_NONBLOCK=1
+export SHADPS4_VK_PSO_WORKERS=2
+export SHADPS4_VK_PSO_BUDGET_US=3500
+```
+Use only for benchmark exploration. This may skip draw/dispatch work while compile state is `Compiling`.
+
 
 ## Test Route Protocol (Bloodborne)
 1. Cold run: first launch after cache clear.
