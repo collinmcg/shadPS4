@@ -89,6 +89,8 @@ public:
         u64 compute_sync_fallbacks{};
         u64 async_queue_depth_peak{};
         u64 async_queue_tasks_completed{};
+        u64 async_queue_budget_warnings{};
+        u64 async_queue_enqueue_skips{};
     };
 
 public:

@@ -329,11 +329,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             ++perf_counters.graphics_async_queue_hits;
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
             if (compile_queue) {
-                const auto hash_for_task = pipeline_hash;
-                compile_queue->Enqueue([hash_for_task] {
-                    // Placeholder task for staged async rollout instrumentation.
-                    (void)hash_for_task;
-                });
+                const auto depth_before = compile_queue->QueueDepth();
+                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                    ++perf_counters.async_queue_enqueue_skips;
+                    ++perf_counters.graphics_sync_fallbacks;
+                } else {
+                    const auto hash_for_task = pipeline_hash;
+                    const auto budget_us = async_pso_soft_budget_us;
+                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        // Placeholder task for staged async rollout instrumentation.
+                        (void)hash_for_task;
+                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - t0)
+                                            .count();
+                        (void)budget_us;
+                        (void)dt;
+                    });
+                }
                 perf_counters.async_queue_depth_peak =
                     std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
                 perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
@@ -361,12 +374,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             if ((total_compiles % 128) == 0) {
                 LOG_INFO(Render_Vulkan,
                          "Async PSO staged stats: g_miss={} c_miss={} g_compile={} c_compile={} "
-                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={}",
+                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={}",
                          perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
                          perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
                          perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
                          perf_counters.async_queue_depth_peak,
-                         perf_counters.async_queue_tasks_completed);
+                         perf_counters.async_queue_tasks_completed,
+                         perf_counters.async_queue_enqueue_skips,
+                         perf_counters.async_queue_budget_warnings);
             }
         }
 
@@ -400,11 +415,24 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             ++perf_counters.compute_async_queue_hits;
             SetComputeBuildState(compute_key, PipelineBuildState::Queued);
             if (compile_queue) {
-                const auto hash_for_task = pipeline_hash;
-                compile_queue->Enqueue([hash_for_task] {
-                    // Placeholder task for staged async rollout instrumentation.
-                    (void)hash_for_task;
-                });
+                const auto depth_before = compile_queue->QueueDepth();
+                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                    ++perf_counters.async_queue_enqueue_skips;
+                    ++perf_counters.compute_sync_fallbacks;
+                } else {
+                    const auto hash_for_task = pipeline_hash;
+                    const auto budget_us = async_pso_soft_budget_us;
+                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        // Placeholder task for staged async rollout instrumentation.
+                        (void)hash_for_task;
+                        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - t0)
+                                            .count();
+                        (void)budget_us;
+                        (void)dt;
+                    });
+                }
                 perf_counters.async_queue_depth_peak =
                     std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
                 perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
@@ -432,12 +460,14 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             if ((total_compiles % 128) == 0) {
                 LOG_INFO(Render_Vulkan,
                          "Async PSO staged stats: g_miss={} c_miss={} g_compile={} c_compile={} "
-                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={}",
+                         "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={}",
                          perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
                          perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
                          perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
                          perf_counters.async_queue_depth_peak,
-                         perf_counters.async_queue_tasks_completed);
+                         perf_counters.async_queue_tasks_completed,
+                         perf_counters.async_queue_enqueue_skips,
+                         perf_counters.async_queue_budget_warnings);
             }
         }
 
