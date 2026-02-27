@@ -11,3 +11,10 @@
 - Feature remains flag-gated (`SHADPS4_VK_PSO_ASYNC`)
 - Fallback to sync path preserved
 - Default behavior unchanged when flags unset
+
+
+## Status
+- ✅ Key-aware deferred payload wiring complete
+- ✅ Deferred outcome handling complete
+- ✅ Recovery path documented and review packet added
+- ⏭️ Next PR: true Vulkan background compile execution
