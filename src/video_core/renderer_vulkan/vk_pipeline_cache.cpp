@@ -314,13 +314,16 @@ void PipelineCache::SetGraphicsBuildState(const GraphicsPipelineKey& key, Pipeli
 void PipelineCache::LogStagedAsyncSnapshot(std::string_view reason) const {
     LOG_INFO(Render_Vulkan,
              "Async PSO snapshot [{}]: g_miss={} c_miss={} g_compile={} c_compile={} "
-             "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={} q_throttle={}",
+             "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={} q_throttle={} "
+             "d_calls={} d_budget={} d_fail={}",
              reason, perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
              perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
              perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
              perf_counters.async_queue_depth_peak, perf_counters.async_queue_tasks_completed,
              perf_counters.async_queue_enqueue_skips, perf_counters.async_queue_budget_warnings,
-             perf_counters.async_throttle_hits);
+             perf_counters.async_throttle_hits, perf_counters.deferred_handler_calls,
+             perf_counters.deferred_handler_budget_exceeded,
+             perf_counters.deferred_handler_failures);
 }
 
 void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state) {
@@ -350,20 +353,37 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
 
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
-    // PR2 staged hook: payload-aware deferred compile execution will be implemented here.
-    // Keep this no-op for safety until key-specific compile execution is validated.
-    (void)payload;
-    (void)budget_us;
+    // PR2 staged hook: payload-aware deferred compile execution scaffold.
+    // Keep this low-risk while validating queue dynamics.
+    ++perf_counters.deferred_handler_calls;
+    try {
+        const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+        const u64 age_us = now_us > payload.enqueued_ts_us ? (now_us - payload.enqueued_ts_us) : 0;
+        if (age_us > budget_us) {
+            ++perf_counters.deferred_handler_budget_exceeded;
+            ++perf_counters.async_queue_budget_warnings;
+        }
+    } catch (...) {
+        ++perf_counters.deferred_handler_failures;
+    }
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    if (async_pso_requested && async_pso_nonblock &&
-        GetGraphicsBuildState(graphics_key) == PipelineBuildState::Compiling) {
-        // Staged non-blocking path: skip this draw call pipeline fetch while compile is in-flight.
-        return nullptr;
+    if (async_pso_requested && async_pso_nonblock) {
+        const auto state = GetGraphicsBuildState(graphics_key);
+        if (state == PipelineBuildState::Compiling) {
+            // Staged non-blocking path: skip this draw call pipeline fetch while compile is in-flight.
+            return nullptr;
+        }
+        if (state == PipelineBuildState::Failed) {
+            // Hard fallback: clear failed state and allow deterministic sync rebuild path.
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Missing);
+        }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
@@ -443,10 +463,16 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    if (async_pso_requested && async_pso_nonblock &&
-        GetComputeBuildState(compute_key) == PipelineBuildState::Compiling) {
-        // Staged non-blocking path: skip this dispatch pipeline fetch while compile is in-flight.
-        return nullptr;
+    if (async_pso_requested && async_pso_nonblock) {
+        const auto state = GetComputeBuildState(compute_key);
+        if (state == PipelineBuildState::Compiling) {
+            // Staged non-blocking path: skip this dispatch pipeline fetch while compile is in-flight.
+            return nullptr;
+        }
+        if (state == PipelineBuildState::Failed) {
+            // Hard fallback: clear failed state and allow deterministic sync rebuild path.
+            SetComputeBuildState(compute_key, PipelineBuildState::Missing);
+        }
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {

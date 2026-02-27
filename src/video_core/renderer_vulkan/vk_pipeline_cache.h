@@ -98,6 +98,9 @@ public:
         u64 async_queue_budget_warnings{};
         u64 async_queue_enqueue_skips{};
         u64 async_throttle_hits{};
+        u64 deferred_handler_calls{};
+        u64 deferred_handler_budget_exceeded{};
+        u64 deferred_handler_failures{};
     };
 
 public:
