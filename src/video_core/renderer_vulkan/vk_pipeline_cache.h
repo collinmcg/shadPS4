@@ -97,6 +97,7 @@ public:
         u64 async_queue_tasks_completed{};
         u64 async_queue_budget_warnings{};
         u64 async_queue_enqueue_skips{};
+        u64 async_throttle_hits{};
     };
 
 public:

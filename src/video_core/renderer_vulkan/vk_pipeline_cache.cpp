@@ -314,12 +314,13 @@ void PipelineCache::SetGraphicsBuildState(const GraphicsPipelineKey& key, Pipeli
 void PipelineCache::LogStagedAsyncSnapshot(std::string_view reason) const {
     LOG_INFO(Render_Vulkan,
              "Async PSO snapshot [{}]: g_miss={} c_miss={} g_compile={} c_compile={} "
-             "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={}",
+             "g_sync_fb={} c_sync_fb={} q_peak={} q_done={} q_skip={} q_budget_warn={} q_throttle={}",
              reason, perf_counters.graphics_cache_misses, perf_counters.compute_cache_misses,
              perf_counters.graphics_compile_count, perf_counters.compute_compile_count,
              perf_counters.graphics_sync_fallbacks, perf_counters.compute_sync_fallbacks,
              perf_counters.async_queue_depth_peak, perf_counters.async_queue_tasks_completed,
-             perf_counters.async_queue_enqueue_skips, perf_counters.async_queue_budget_warnings);
+             perf_counters.async_queue_enqueue_skips, perf_counters.async_queue_budget_warnings,
+             perf_counters.async_throttle_hits);
 }
 
 void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state) {
@@ -368,6 +369,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
                 if (ShouldThrottleSyncFallback(depth_before)) {
+                    ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.graphics_sync_fallbacks;
@@ -457,6 +459,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
                 if (ShouldThrottleSyncFallback(depth_before)) {
+                    ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.compute_sync_fallbacks;
