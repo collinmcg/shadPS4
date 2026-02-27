@@ -65,6 +65,16 @@ struct Program {
 
 class PipelineCache {
 public:
+    struct PerfCounters {
+        u64 graphics_cache_misses{};
+        u64 compute_cache_misses{};
+        u64 graphics_compile_count{};
+        u64 compute_compile_count{};
+        u64 graphics_compile_time_us{};
+        u64 compute_compile_time_us{};
+    };
+
+public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool);
     ~PipelineCache();
@@ -93,6 +103,10 @@ public:
 
     auto& GetProfile() const {
         return profile;
+    }
+
+    [[nodiscard]] const PerfCounters& GetPerfCounters() const {
+        return perf_counters;
     }
 
 private:
@@ -132,6 +146,7 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    PerfCounters perf_counters{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

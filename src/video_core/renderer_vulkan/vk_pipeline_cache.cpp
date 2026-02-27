@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ranges>
+#include <chrono>
+#include <cstdlib>
 
 #include "common/config.h"
 #include "common/hash.h"
@@ -226,6 +228,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+    // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
+    // switch used to align metrics/logging and staged rollout experiments.
+    const bool async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
+    if (async_pso_requested) {
+        LOG_INFO(Render_Vulkan,
+                 "SHADPS4_VK_PSO_ASYNC is set: using sync compile path with perf counters (staged rollout)");
+    }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
@@ -289,13 +298,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        ++perf_counters.graphics_cache_misses;
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto t0 = std::chrono::steady_clock::now();
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++perf_counters.graphics_compile_count;
+        perf_counters.graphics_compile_time_us += static_cast<u64>(dt);
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -319,13 +335,21 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        ++perf_counters.compute_cache_misses;
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
+        const auto t0 = std::chrono::steady_clock::now();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        ++perf_counters.compute_compile_count;
+        perf_counters.compute_compile_time_us += static_cast<u64>(dt);
+
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
