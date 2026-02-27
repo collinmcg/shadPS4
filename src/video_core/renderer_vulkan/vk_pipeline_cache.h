@@ -79,6 +79,8 @@ public:
     struct DeferredCompilePayload {
         u64 key_hash{};
         bool is_compute{};
+        std::optional<GraphicsPipelineKey> graphics_key{};
+        std::optional<ComputePipelineKey> compute_key{};
         u64 enqueued_ts_us{};
     };
 
