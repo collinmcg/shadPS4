@@ -1,0 +1,7 @@
+# format: <g|c> <hash_hex> <priority>
+# g = graphics pipeline hash, c = compute pipeline hash
+# higher priority loads first
+
+g deadbeefcafe1234 100
+c 01ab23cd45ef6789 90
+g 0f0f0f0f0f0f0f0f 50

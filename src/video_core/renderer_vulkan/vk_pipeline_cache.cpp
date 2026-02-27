@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ranges>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <filesystem>
 
 #include "common/config.h"
 #include "common/hash.h"
@@ -238,12 +242,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (const char* budget = std::getenv("SHADPS4_VK_PSO_BUDGET_US")) {
         async_pso_soft_budget_us = std::max(500, std::atoi(budget));
     }
+    prewarm_enabled = std::getenv("SHADPS4_VK_PSO_PREWARM") != nullptr;
     if (async_pso_requested) {
         compile_queue = std::make_unique<PipelineCompileQueue>(async_pso_workers);
         compile_queue->Start();
         LOG_INFO(Render_Vulkan,
                  "SHADPS4_VK_PSO_ASYNC enabled: queue started (workers={}, budget_us={}, sync fallback active)",
                  async_pso_workers, async_pso_soft_budget_us);
+    }
+    if (prewarm_enabled) {
+        LoadPrewarmManifest();
+        SchedulePrewarmEntries();
     }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -397,6 +406,62 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
             }
         }
     }
+}
+
+void PipelineCache::LoadPrewarmManifest() {
+    prewarm_entries.clear();
+    namespace fs = std::filesystem;
+    const fs::path path{"prewarm_manifest.txt"};
+    if (!fs::exists(path)) {
+        LOG_INFO(Render_Vulkan, "Prewarm manifest not found: {}", path.string());
+        return;
+    }
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        LOG_WARNING(Render_Vulkan, "Failed to open prewarm manifest: {}", path.string());
+        return;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        // format: <g|c> <hash> <priority>
+        char kind{};
+        unsigned long long hash{};
+        unsigned int prio{};
+        if (std::sscanf(line.c_str(), "%c %llx %u", &kind, &hash, &prio) == 3) {
+            prewarm_entries.push_back(PrewarmEntry{.key_hash = static_cast<u64>(hash),
+                                                   .is_compute = (kind == 'c' || kind == 'C'),
+                                                   .priority = prio});
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Loaded {} prewarm entries", prewarm_entries.size());
+}
+
+void PipelineCache::SchedulePrewarmEntries() {
+    if (!compile_queue || prewarm_entries.empty()) {
+        return;
+    }
+    std::sort(prewarm_entries.begin(), prewarm_entries.end(),
+              [](const PrewarmEntry& a, const PrewarmEntry& b) { return a.priority > b.priority; });
+    u32 queued = 0;
+    for (const auto& e : prewarm_entries) {
+        if (queued >= 128) {
+            break;
+        }
+        const DeferredCompilePayload payload{.key_hash = e.key_hash,
+                                             .is_compute = e.is_compute,
+                                             .graphics_key = std::nullopt,
+                                             .compute_key = std::nullopt,
+                                             .enqueued_ts_us = static_cast<u64>(
+                                                 std::chrono::duration_cast<std::chrono::microseconds>(
+                                                     std::chrono::steady_clock::now().time_since_epoch())
+                                                     .count())};
+        compile_queue->Enqueue([this, payload] { HandleDeferredCompilePayload(payload, async_pso_soft_budget_us); });
+        ++queued;
+    }
+    LOG_INFO(Render_Vulkan, "Scheduled {} prewarm entries", queued);
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
