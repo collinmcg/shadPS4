@@ -76,6 +76,12 @@ public:
         Failed,
     };
 
+    struct DeferredCompilePayload {
+        u64 key_hash{};
+        bool is_compute{};
+        u64 enqueued_ts_us{};
+    };
+
     struct PerfCounters {
         u64 graphics_cache_misses{};
         u64 compute_cache_misses{};
@@ -139,6 +145,7 @@ private:
     void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
     [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
+    [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);

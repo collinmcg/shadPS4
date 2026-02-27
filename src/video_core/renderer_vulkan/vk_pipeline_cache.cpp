@@ -341,6 +341,12 @@ PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
     return it == compute_build_states.end() ? PipelineBuildState::Missing : it->second;
 }
 
+bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
+    // Conservative policy for staged rollout: only signal throttle at high queue pressure.
+    const u32 high_watermark = std::max<u32>(8u, async_pso_workers * 6u);
+    return queue_depth >= high_watermark;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -361,17 +367,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
-                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.graphics_sync_fallbacks;
                 } else {
-                    const auto hash_for_task = pipeline_hash;
+                    const DeferredCompilePayload payload{
+                        .key_hash = pipeline_hash,
+                        .is_compute = false,
+                        .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                    };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                    compile_queue->Enqueue([payload, budget_us] {
                         const auto t0 = std::chrono::steady_clock::now();
                         // Placeholder task for staged async rollout instrumentation.
-                        (void)hash_for_task;
+                        (void)payload;
                         const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
                                             std::chrono::steady_clock::now() - t0)
                                             .count();
@@ -444,17 +456,23 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             SetComputeBuildState(compute_key, PipelineBuildState::Queued);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
-                if (depth_before > static_cast<u32>(async_pso_workers * 8)) {
+                if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.compute_sync_fallbacks;
                 } else {
-                    const auto hash_for_task = pipeline_hash;
+                    const DeferredCompilePayload payload{
+                        .key_hash = pipeline_hash,
+                        .is_compute = true,
+                        .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                    };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([hash_for_task, budget_us] {
+                    compile_queue->Enqueue([payload, budget_us] {
                         const auto t0 = std::chrono::steady_clock::now();
                         // Placeholder task for staged async rollout instrumentation.
-                        (void)hash_for_task;
+                        (void)payload;
                         const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
                                             std::chrono::steady_clock::now() - t0)
                                             .count();
