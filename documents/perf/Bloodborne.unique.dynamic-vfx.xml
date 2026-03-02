@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Patch>
+    <TitleID>
+        <ID>CUSA00207</ID>
+        <ID>CUSA00208</ID>
+        <ID>CUSA00299</ID>
+        <ID>CUSA00900</ID>
+        <ID>CUSA01363</ID>
+        <ID>CUSA03023</ID>
+        <ID>CUSA03173</ID>
+    </TitleID>
+
+    <Metadata Title="Bloodborne"
+              Name="Dynamic VFX Budget Governor (Experimental)"
+              Note="Unique concept patch. Adaptive VFX spawn/update throttling for off-center + far effects under frametime pressure. Pattern placeholders must be replaced with validated 1.09 signatures before enabling."
+              Author="Jane"
+              PatchVer="0.1"
+              AppVer="01.09"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!--
+              IMPORTANT:
+              - This XML is intentionally scaffold-only.
+              - Replace Address/Target patterns below with validated 1.09 signatures.
+              - Keep disabled until signatures and jump sizes are confirmed in disassembly.
+            -->
+
+            <!-- Hook 1: VFX spawn gate -->
+            <Line Type="mask_jump32"
+                  Address="AA BB CC DD EE FF ?? ?? 48 8B ?? ??"
+                  Offset="0"
+                  Target="90 90 90 90 90 90 90 90 90 90"
+                  Size="10"
+                  Value=""
+            />
+
+            <!-- Hook 2: VFX update-rate governor -->
+            <Line Type="mask_jump32"
+                  Address="48 8B ?? ?? ?? ?? 48 85 ?? 74 ??"
+                  Offset="0"
+                  Target="90 90 90 90 90 90 90 90 90 90 90 90"
+                  Size="12"
+                  Value=""
+            />
+
+            <!-- Tunables (replace with real addresses once identified) -->
+            <!-- Example semantics:
+                 - Budget scale (float32)
+                 - Distance threshold (float32)
+                 - Screen-weight threshold (float32)
+                 - Frametime trigger in ms (float32)
+            -->
+            <Line Type="mask" Address="F3 0F 10 ?? ?? ?? ?? ?? F3 0F 59" Offset="0" Value=""/>
+            <Line Type="mask" Address="F3 0F 10 ?? ?? ?? ?? ?? 0F 2F" Offset="0" Value=""/>
+        </PatchList>
+    </Metadata>
+</Patch>
