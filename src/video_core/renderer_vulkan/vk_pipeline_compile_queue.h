@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include "common/types.h"
+
 namespace Vulkan {
 
 class PipelineCompileQueue {
