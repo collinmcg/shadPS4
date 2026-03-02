@@ -43,4 +43,20 @@
             <Line Type="bytes" Address="0x0227E2F0" Value="9090909090"/>
         </PatchList>
     </Metadata>
+
+    <Metadata Title="Bloodborne"
+              Name="4K60 Balanced Light-Grid (Experimental)"
+              Note="Novel middle-ground light-grid target for 4K output. Reduces lighting-grid pressure versus full 4K grid while preserving more detail than 1440p grid. Pair with 60FPS+DT or 30FPS profile, not both."
+              Author="Jane (OpenClaw R&amp;D)"
+              PatchVer="0.1"
+              AppVer="01.09"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- light-grid width  = 0x00000C00 (3072) -->
+            <Line Type="bytes" Address="0x02695CB6" Value="C783A8780000000C0000"/>
+            <!-- light-grid height = 0x000006C0 (1728) -->
+            <Line Type="bytes" Address="0x02695CC0" Value="C783AC780000C0060000"/>
+        </PatchList>
+    </Metadata>
 </Patch>
