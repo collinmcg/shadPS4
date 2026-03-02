@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <thread>
 
 #include "common/config.h"
 #include "common/hash.h"
@@ -232,17 +233,31 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
-    // Async PSO path is intentionally not enabled here yet; this env flag is a forward-compat
-    // switch used to align metrics/logging and staged rollout experiments.
-    async_pso_requested = std::getenv("SHADPS4_VK_PSO_ASYNC") != nullptr;
-    async_pso_nonblock = std::getenv("SHADPS4_VK_PSO_NONBLOCK") != nullptr;
+    // Aggressive-by-default async PSO profile for best out-of-box performance.
+    async_pso_requested = true;
+    async_pso_nonblock = true;
+    async_pso_workers = std::max(2u, std::thread::hardware_concurrency() > 0
+                                         ? (std::thread::hardware_concurrency() - 1)
+                                         : 4u);
+    async_pso_soft_budget_us = 8000;
+    prewarm_enabled = true;
+
+    // Environment overrides remain available for tuning or rollback.
+    if (const char* async_env = std::getenv("SHADPS4_VK_PSO_ASYNC")) {
+        async_pso_requested = std::atoi(async_env) != 0;
+    }
+    if (const char* nonblock_env = std::getenv("SHADPS4_VK_PSO_NONBLOCK")) {
+        async_pso_nonblock = std::atoi(nonblock_env) != 0;
+    }
     if (const char* workers = std::getenv("SHADPS4_VK_PSO_WORKERS")) {
         async_pso_workers = std::max(1, std::atoi(workers));
     }
     if (const char* budget = std::getenv("SHADPS4_VK_PSO_BUDGET_US")) {
         async_pso_soft_budget_us = std::max(500, std::atoi(budget));
     }
-    prewarm_enabled = std::getenv("SHADPS4_VK_PSO_PREWARM") != nullptr;
+    if (const char* prewarm_env = std::getenv("SHADPS4_VK_PSO_PREWARM")) {
+        prewarm_enabled = std::atoi(prewarm_env) != 0;
+    }
     if (async_pso_requested) {
         compile_queue = std::make_unique<PipelineCompileQueue>(async_pso_workers);
         compile_queue->Start();
@@ -355,8 +370,8 @@ PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
 }
 
 bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
-    // Conservative policy for staged rollout: only signal throttle at high queue pressure.
-    const u32 high_watermark = std::max<u32>(8u, async_pso_workers * 6u);
+    // Aggressive profile: allow deeper queue before forcing throttle/fallback behavior.
+    const u32 high_watermark = std::max<u32>(24u, async_pso_workers * 12u);
     return queue_depth >= high_watermark;
 }
 
@@ -447,7 +462,7 @@ void PipelineCache::SchedulePrewarmEntries() {
               [](const PrewarmEntry& a, const PrewarmEntry& b) { return a.priority > b.priority; });
     u32 queued = 0;
     for (const auto& e : prewarm_entries) {
-        if (queued >= 128) {
+        if (queued >= 512) {
             break;
         }
         const DeferredCompilePayload payload{.key_hash = e.key_hash,
