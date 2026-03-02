@@ -38,6 +38,7 @@ private:
     std::queue<Task> tasks_;
     std::vector<std::thread> workers_;
     std::atomic<bool> running_{false};
+    std::atomic<u32> queue_depth_{0};
     std::atomic<u64> completed_{0};
 };
 
