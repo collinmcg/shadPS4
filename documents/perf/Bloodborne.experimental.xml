@@ -13,7 +13,7 @@
     <Metadata Title="Bloodborne"
               Name="Performance Breakthrough Experimental"
               Note="Experimental composite: no overlapping addresses inside this profile. Built for AppVer 01.09. Validate stability per-zone before public use."
-              Author="Jane (OpenClaw R&D)"
+              Author="Jane (OpenClaw R&amp;D)"
               PatchVer="0.1"
               AppVer="01.09"
               AppElf="eboot.bin"
