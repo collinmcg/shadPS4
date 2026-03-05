@@ -387,6 +387,22 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
     return queue_depth >= high_watermark;
 }
 
+void PipelineCache::UpdateAsyncQueueObservability(u32 queue_depth) {
+    perf_counters.async_queue_depth_peak =
+        std::max<u64>(perf_counters.async_queue_depth_peak, queue_depth);
+    if (!compile_queue) {
+        return;
+    }
+
+    const u64 total_misses =
+        perf_counters.graphics_cache_misses + perf_counters.compute_cache_misses;
+    // Queue completion count is telemetry-only; sample periodically when idle to reduce
+    // miss-path atomic churn, but sample every miss while depth is non-zero.
+    if (queue_depth > 0 || (total_misses % 16) == 0) {
+        perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+    }
+}
+
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
     // PR3 staged hook: key-aware deferred execution outcome handling.
@@ -534,9 +550,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                         HandleDeferredCompilePayload(payload, budget_us);
                     });
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(depth_before);
             }
         }
 
@@ -633,9 +647,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                         HandleDeferredCompilePayload(payload, budget_us);
                     });
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(depth_before);
             }
         }
 
