@@ -53,7 +53,7 @@ u32 PipelineCompileQueue::QueueDepth() const {
 }
 
 u64 PipelineCompileQueue::CompletedTasks() const {
-    return completed_.load();
+    return completed_.load(std::memory_order_relaxed);
 }
 
 void PipelineCompileQueue::WorkerLoop() {
@@ -72,7 +72,7 @@ void PipelineCompileQueue::WorkerLoop() {
 
         if (task) {
             task();
-            ++completed_;
+            completed_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }

@@ -375,6 +375,22 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
     return queue_depth >= high_watermark;
 }
 
+void PipelineCache::UpdateAsyncQueueObservability(u32 queue_depth) {
+    perf_counters.async_queue_depth_peak =
+        std::max<u64>(perf_counters.async_queue_depth_peak, queue_depth);
+    if (!compile_queue) {
+        return;
+    }
+
+    const u64 total_misses =
+        perf_counters.graphics_cache_misses + perf_counters.compute_cache_misses;
+    // Queue completion count is telemetry-only; sample periodically when idle to reduce
+    // miss-path atomic churn, but sample every miss while depth is non-zero.
+    if (queue_depth > 0 || (total_misses % 16) == 0) {
+        perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+    }
+}
+
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
     // PR3 staged hook: key-aware deferred execution outcome handling.
@@ -502,32 +518,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.graphics_async_queue_hits;
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
             if (compile_queue) {
+                // The staged async path still compiles synchronously today. Avoid queueing
+                // no-op payload handlers on the render-thread miss path; those extra enqueue/
+                // wake/lock cycles can amplify frame-time spikes during bursty PSO creation.
                 const auto depth_before = compile_queue->QueueDepth();
                 if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.graphics_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = false,
-                        .graphics_key = graphics_key,
-                        .compute_key = std::nullopt,
-                        .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                             std::chrono::steady_clock::now().time_since_epoch())
-                                             .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
                 }
-                perf_counters.async_queue_depth_peak =
-                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(depth_before);
             }
         }
 
@@ -593,32 +595,17 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.compute_async_queue_hits;
-            SetComputeBuildState(compute_key, PipelineBuildState::Queued);
             if (compile_queue) {
+                // Mirror graphics-path policy: skip no-op queue work while compile fallback
+                // remains synchronous in this staged rollout.
                 const auto depth_before = compile_queue->QueueDepth();
                 if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.compute_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = true,
-                        .graphics_key = std::nullopt,
-                        .compute_key = compute_key,
-                        .enqueued_ts_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                             std::chrono::steady_clock::now().time_since_epoch())
-                                             .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
                 }
-                perf_counters.async_queue_depth_peak =
-                    std::max<u64>(perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(depth_before);
             }
         }
 
@@ -641,7 +628,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             const u64 total_compiles =
                 perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
             if ((total_compiles % 128) == 0) {
-                LogStagedAsyncSnapshot("graphics_compile_periodic");
+                LogStagedAsyncSnapshot("compute_compile_periodic");
             }
         }
 
