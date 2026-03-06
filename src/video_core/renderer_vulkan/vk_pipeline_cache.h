@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include <variant>
 #include <memory>
 #include <mutex>
+#include <variant>
 #include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
