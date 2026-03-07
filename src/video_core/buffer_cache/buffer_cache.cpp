@@ -570,6 +570,7 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     }
     const Buffer& buffer = slot_buffers[buffer_id];
     if (buffer.IsInBounds(device_addr, size)) {
+        TouchBuffer(buffer);
         return buffer_id;
     }
     return CreateBuffer(device_addr, size);
