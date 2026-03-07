@@ -357,6 +357,16 @@ void PipelineCache::SetComputeBuildState(const ComputePipelineKey& key, Pipeline
     compute_build_states[key] = state;
 }
 
+void PipelineCache::ClearGraphicsBuildState(const GraphicsPipelineKey& key) {
+    std::scoped_lock lk{build_state_mutex};
+    graphics_build_states.erase(key);
+}
+
+void PipelineCache::ClearComputeBuildState(const ComputePipelineKey& key) {
+    std::scoped_lock lk{build_state_mutex};
+    compute_build_states.erase(key);
+}
+
 PipelineCache::PipelineBuildState PipelineCache::GetGraphicsBuildState(
     const GraphicsPipelineKey& key) const {
     std::scoped_lock lk{build_state_mutex};
@@ -474,6 +484,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+
+    if (const auto it = graphics_pipelines.find(graphics_key); it != graphics_pipelines.end()) {
+        return it->second.get();
+    }
+
     if (async_pso_requested && async_pso_nonblock) {
         const auto state = GetGraphicsBuildState(graphics_key);
         if (state == PipelineBuildState::Compiling) {
@@ -483,9 +498,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         }
         if (state == PipelineBuildState::Failed) {
             // Hard fallback: clear failed state and allow deterministic sync rebuild path.
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Missing);
+            ClearGraphicsBuildState(graphics_key);
         }
     }
+
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         ++perf_counters.graphics_cache_misses;
@@ -539,7 +555,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         ++perf_counters.graphics_compile_count;
         perf_counters.graphics_compile_time_us += static_cast<u64>(dt);
         if (async_pso_requested) {
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Ready);
+            ClearGraphicsBuildState(graphics_key);
             const u64 total_compiles =
                 perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
             if ((total_compiles % 128) == 0) {
@@ -567,6 +583,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+
+    if (const auto it = compute_pipelines.find(compute_key); it != compute_pipelines.end()) {
+        return it->second.get();
+    }
+
     if (async_pso_requested && async_pso_nonblock) {
         const auto state = GetComputeBuildState(compute_key);
         if (state == PipelineBuildState::Compiling) {
@@ -576,9 +597,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         }
         if (state == PipelineBuildState::Failed) {
             // Hard fallback: clear failed state and allow deterministic sync rebuild path.
-            SetComputeBuildState(compute_key, PipelineBuildState::Missing);
+            ClearComputeBuildState(compute_key);
         }
     }
+
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
         ++perf_counters.compute_cache_misses;
@@ -632,11 +654,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         ++perf_counters.compute_compile_count;
         perf_counters.compute_compile_time_us += static_cast<u64>(dt);
         if (async_pso_requested) {
-            SetComputeBuildState(compute_key, PipelineBuildState::Ready);
+            ClearComputeBuildState(compute_key);
             const u64 total_compiles =
                 perf_counters.graphics_compile_count + perf_counters.compute_compile_count;
             if ((total_compiles % 128) == 0) {
-                LogStagedAsyncSnapshot("graphics_compile_periodic");
+                LogStagedAsyncSnapshot("compute_compile_periodic");
             }
         }
 

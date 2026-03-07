@@ -156,6 +156,8 @@ private:
 
     void SetGraphicsBuildState(const GraphicsPipelineKey& key, PipelineBuildState state);
     void SetComputeBuildState(const ComputePipelineKey& key, PipelineBuildState state);
+    void ClearGraphicsBuildState(const GraphicsPipelineKey& key);
+    void ClearComputeBuildState(const ComputePipelineKey& key);
     [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
     [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
