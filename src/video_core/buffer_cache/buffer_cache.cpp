@@ -67,6 +67,14 @@ namespace {
     return enabled;
 }
 
+[[nodiscard]] bool IsBufferGcSyncReadbackEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_SYNC_READBACK");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -927,6 +935,7 @@ void BufferCache::RunGarbageCollector() {
     const bool gc_dry_run = IsBufferGcDryRunEnabled();
     const bool gc_readback_only_requested = IsBufferGcReadbackOnlyEnabled();
     const bool gc_delete_only_requested = IsBufferGcDeleteOnlyEnabled();
+    const bool gc_sync_readback = IsBufferGcSyncReadbackEnabled();
 
     if (gc_readback_only_requested && gc_delete_only_requested) {
         LOG_WARNING(Render_Vulkan,
@@ -941,9 +950,9 @@ void BufferCache::RunGarbageCollector() {
     if (trace_gc_logging) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC mode: tick={} used={} trigger={} critical={} disabled={} dry_run={} "
-                 "readback_only={} delete_only={}",
+                 "readback_only={} delete_only={} sync_readback={}",
                  gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory, gc_disabled,
-                 gc_dry_run, gc_readback_only, gc_delete_only);
+                 gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback);
     }
 
     if (gc_disabled) {
@@ -976,10 +985,10 @@ void BufferCache::RunGarbageCollector() {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} "
                      "used={} trigger={} critical={} tick={} dry_run={} readback_only={} "
-                     "delete_only={}",
+                     "delete_only={} sync_readback={}",
                      buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
                      total_used_memory, trigger_gc_memory, critical_gc_memory, gc_tick,
-                     gc_dry_run, gc_readback_only, gc_delete_only);
+                     gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback);
         }
 
         if (gc_dry_run) {
@@ -989,15 +998,21 @@ void BufferCache::RunGarbageCollector() {
 
         if (!gc_delete_only) {
             // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
-            if (!DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes(), true)) {
+            const bool readback_ok = gc_sync_readback
+                                         ? DownloadBufferMemory<false>(
+                                               buffer, buffer.CpuAddr(), buffer.SizeBytes(), true)
+                                         : DownloadBufferMemory<true>(
+                                               buffer, buffer.CpuAddr(), buffer.SizeBytes(), true);
+            if (!readback_ok) {
                 ++skipped_buffers;
                 LOG_WARNING(Render_Vulkan,
                             "Buffer GC skipped eviction due to failed readback: id={} addr={:#x} "
                             "size={} bytes lru_id={} tick={} used={} trigger={} critical={} "
-                            "dry_run={} readback_only={} delete_only={}",
+                            "dry_run={} readback_only={} delete_only={} sync_readback={}",
                             buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(),
                             buffer.LRUId(), gc_tick, total_used_memory, trigger_gc_memory,
-                            critical_gc_memory, gc_dry_run, gc_readback_only, gc_delete_only);
+                            critical_gc_memory, gc_dry_run, gc_readback_only, gc_delete_only,
+                            gc_sync_readback);
                 return false;
             }
             ++readback_successes;
@@ -1034,16 +1049,16 @@ void BufferCache::RunGarbageCollector() {
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (verbose_gc_logging || trace_gc_logging || skipped_buffers > 0 || gc_dry_run ||
-        gc_readback_only || gc_delete_only) {
+        gc_readback_only || gc_delete_only || gc_sync_readback) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} aggressive={} used={} trigger={} critical={} "
                  "max_deletions={} candidates={} readback_ok={} readback_skipped={} "
                  "deleted={} delete_skipped={} skipped={} ticks_to_destroy={} "
-                 "dry_run={} readback_only={} delete_only={} disabled={}",
+                 "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
                  gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
                  max_deletions_allowed, selected_candidates, readback_successes, readback_skipped,
                  deleted_buffers, delete_skipped, skipped_buffers, ticks_to_destroy, gc_dry_run,
-                 gc_readback_only, gc_delete_only, gc_disabled);
+                 gc_readback_only, gc_delete_only, gc_sync_readback, gc_disabled);
     }
 }
 
