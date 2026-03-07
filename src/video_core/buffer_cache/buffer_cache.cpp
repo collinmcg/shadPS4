@@ -176,31 +176,55 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         return true;
     }
 
+    std::unique_ptr<Buffer> temp_download_buffer{};
+    u8* download_ptr = nullptr;
+    u64 staging_offset = 0;
+    vk::Buffer download_dst_buffer = VK_NULL_HANDLE;
+
     if (total_size_bytes > DownloadBufferSize) {
-        LOG_WARNING(
-            Render_Vulkan,
-            "Buffer readback request exceeded staging capacity: request={} bytes copies={} "
-            "staging_cap={} bytes buffer_id={} buffer_addr={:#x} request_addr={:#x} "
-            "request_size={} bytes (async={}, is_write={})",
-            total_size_bytes, copies.size(), DownloadBufferSize, buffer.LRUId(), buffer.CpuAddr(),
-            device_addr, size, async, is_write);
-        return false;
-    }
+        LOG_INFO(Render_Vulkan,
+                 "Buffer readback request exceeded staging capacity, using temporary download "
+                 "buffer: request={} bytes copies={} staging_cap={} bytes buffer_id={} "
+                 "buffer_addr={:#x} request_addr={:#x} request_size={} bytes "
+                 "(async={}, is_write={})",
+                 total_size_bytes, copies.size(), DownloadBufferSize, buffer.LRUId(),
+                 buffer.CpuAddr(), device_addr, size, async, is_write);
 
-    const auto [download, offset] = download_buffer.Map(total_size_bytes);
-    if (!download) {
-        LOG_ERROR(Render_Vulkan,
-                  "Buffer readback map failed: request={} bytes staging_cap={} bytes "
-                  "buffer_id={} buffer_addr={:#x} request_addr={:#x} request_size={} bytes "
-                  "(async={}, is_write={})",
-                  total_size_bytes, DownloadBufferSize, buffer.LRUId(), buffer.CpuAddr(),
-                  device_addr, size, async, is_write);
-        return false;
-    }
+        temp_download_buffer =
+            std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
+                                     vk::BufferUsageFlagBits::eTransferDst, total_size_bytes);
+        if (temp_download_buffer->mapped_data.empty()) {
+            LOG_ERROR(Render_Vulkan,
+                      "Buffer readback temporary download buffer map failed: request={} bytes "
+                      "buffer_id={} buffer_addr={:#x} request_addr={:#x} request_size={} bytes "
+                      "(async={}, is_write={})",
+                      total_size_bytes, buffer.LRUId(), buffer.CpuAddr(), device_addr, size,
+                      async, is_write);
+            return false;
+        }
 
-    for (auto& copy : copies) {
-        // Modify copies to have the staging offset in mind
-        copy.dstOffset += offset;
+        download_ptr = temp_download_buffer->mapped_data.data();
+        download_dst_buffer = temp_download_buffer->Handle();
+    } else {
+        const auto [download, offset] = download_buffer.Map(total_size_bytes);
+        if (!download) {
+            LOG_ERROR(Render_Vulkan,
+                      "Buffer readback map failed: request={} bytes staging_cap={} bytes "
+                      "buffer_id={} buffer_addr={:#x} request_addr={:#x} request_size={} bytes "
+                      "(async={}, is_write={})",
+                      total_size_bytes, DownloadBufferSize, buffer.LRUId(), buffer.CpuAddr(),
+                      device_addr, size, async, is_write);
+            return false;
+        }
+
+        for (auto& copy : copies) {
+            // Modify copies to have the staging offset in mind
+            copy.dstOffset += offset;
+        }
+        staging_offset = offset;
+        download_ptr = download;
+        download_buffer.Commit();
+        download_dst_buffer = download_buffer.Handle();
     }
 
     const VAddr buffer_cpu_addr = buffer.CpuAddr();
@@ -208,25 +232,25 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     const VAddr request_device_addr = device_addr;
     const u64 request_size = size;
     const bool request_is_write = is_write;
-    const u64 staging_offset = offset;
-    u8* const download_ptr = download;
+    u8* const download_ptr_const = download_ptr;
+    const u64 staging_offset_const = staging_offset;
     auto copies_for_writeback = copies;
 
-    download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+    cmdbuf.copyBuffer(buffer.buffer, download_dst_buffer, copies);
 
     auto write_data = [this, copies = std::move(copies_for_writeback), buffer_cpu_addr,
                        buffer_lru_id, request_device_addr, request_size, request_is_write,
-                       staging_offset, download_ptr]() {
+                       staging_offset_const, download_ptr_const,
+                       temp_download = std::move(temp_download_buffer)]() mutable {
         auto* memory = Core::Memory::Instance();
         u32 invalid_mappings = 0;
         u32 missing_backings = 0;
 
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer_cpu_addr + copy.srcOffset;
-            const u64 dst_offset = copy.dstOffset - staging_offset;
+            const u64 dst_offset = copy.dstOffset - staging_offset_const;
 
             if (!memory->IsValidMapping(copy_device_addr, copy.size)) {
                 ++invalid_mappings;
@@ -242,7 +266,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             }
 
             if (!memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
-                                         download_ptr + dst_offset, copy.size)) {
+                                         download_ptr_const + dst_offset, copy.size)) {
                 ++missing_backings;
                 if (missing_backings <= 3) {
                     LOG_WARNING(Render_Vulkan,
@@ -267,6 +291,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         memory_tracker->UnmarkRegionAsGpuModified(request_device_addr, request_size);
         if (request_is_write) {
             memory_tracker->MarkRegionAsCpuModified(request_device_addr, request_size);
+        }
+        if (temp_download) {
+            temp_download.reset();
         }
     };
 
