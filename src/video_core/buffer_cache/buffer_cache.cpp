@@ -227,6 +227,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         download_dst_buffer = download_buffer.Handle();
     }
 
+    const bool force_sync_for_large_readback = static_cast<bool>(temp_download_buffer);
+
     const VAddr buffer_cpu_addr = buffer.CpuAddr();
     const u32 buffer_lru_id = buffer.LRUId();
     const VAddr request_device_addr = device_addr;
@@ -298,7 +300,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     };
 
     if constexpr (async) {
-        scheduler.DeferOperation(std::move(write_data));
+        if (force_sync_for_large_readback) {
+            scheduler.Finish();
+            write_data();
+        } else {
+            scheduler.DeferOperation(std::move(write_data));
+        }
     } else {
         scheduler.Finish();
         write_data();
