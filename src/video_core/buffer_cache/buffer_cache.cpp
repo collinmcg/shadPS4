@@ -202,25 +202,76 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         // Modify copies to have the staging offset in mind
         copy.dstOffset += offset;
     }
+
+    const VAddr buffer_cpu_addr = buffer.CpuAddr();
+    const u32 buffer_lru_id = buffer.LRUId();
+    const VAddr request_device_addr = device_addr;
+    const u64 request_size = size;
+    const bool request_is_write = is_write;
+    const u64 staging_offset = offset;
+    u8* const download_ptr = download;
+    auto copies_for_writeback = copies;
+
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
-    const auto write_data = [&]() {
+
+    auto write_data = [this, copies = std::move(copies_for_writeback), buffer_cpu_addr,
+                       buffer_lru_id, request_device_addr, request_size, request_is_write,
+                       staging_offset, download_ptr]() {
         auto* memory = Core::Memory::Instance();
+        u32 invalid_mappings = 0;
+        u32 missing_backings = 0;
+
         for (const auto& copy : copies) {
-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
-            const u64 dst_offset = copy.dstOffset - offset;
-            memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
-                                    copy.size);
+            const VAddr copy_device_addr = buffer_cpu_addr + copy.srcOffset;
+            const u64 dst_offset = copy.dstOffset - staging_offset;
+
+            if (!memory->IsValidMapping(copy_device_addr, copy.size)) {
+                ++invalid_mappings;
+                if (invalid_mappings <= 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Buffer GC readback writeback skipped invalid mapping: "
+                                "buffer_lru_id={} copy_addr={:#x} copy_size={} "
+                                "request_addr={:#x} request_size={} bytes",
+                                buffer_lru_id, copy_device_addr, copy.size, request_device_addr,
+                                request_size);
+                }
+                continue;
+            }
+
+            if (!memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
+                                         download_ptr + dst_offset, copy.size)) {
+                ++missing_backings;
+                if (missing_backings <= 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Buffer GC readback writeback had no physical backing: "
+                                "buffer_lru_id={} copy_addr={:#x} copy_size={} "
+                                "request_addr={:#x} request_size={} bytes",
+                                buffer_lru_id, copy_device_addr, copy.size, request_device_addr,
+                                request_size);
+                }
+            }
         }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
-        if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+
+        if (invalid_mappings > 0 || missing_backings > 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Buffer GC readback writeback summary: buffer_lru_id={} "
+                        "invalid_mappings={} missing_backings={} request_addr={:#x} "
+                        "request_size={} bytes",
+                        buffer_lru_id, invalid_mappings, missing_backings, request_device_addr,
+                        request_size);
+        }
+
+        memory_tracker->UnmarkRegionAsGpuModified(request_device_addr, request_size);
+        if (request_is_write) {
+            memory_tracker->MarkRegionAsCpuModified(request_device_addr, request_size);
         }
     };
+
     if constexpr (async) {
-        scheduler.DeferOperation(write_data);
+        scheduler.DeferOperation(std::move(write_data));
     } else {
         scheduler.Finish();
         write_data();
