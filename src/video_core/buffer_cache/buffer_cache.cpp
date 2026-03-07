@@ -27,6 +27,30 @@ namespace {
     return enabled;
 }
 
+[[nodiscard]] bool IsBufferGcTraceLoggingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_TRACE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool IsBufferGcDisabled() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_DISABLE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return disabled;
+}
+
+[[nodiscard]] bool IsBufferGcDryRunEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_DRY_RUN");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -881,11 +905,25 @@ void BufferCache::RunGarbageCollector() {
         return;
     }
 
-    const bool aggressive = total_used_memory >= critical_gc_memory;
     const bool verbose_gc_logging = IsBufferGcVerboseLoggingEnabled();
+    const bool trace_gc_logging = IsBufferGcTraceLoggingEnabled();
+    const bool gc_disabled = IsBufferGcDisabled();
+    const bool gc_dry_run = IsBufferGcDryRunEnabled();
+
+    if (gc_disabled) {
+        if (trace_gc_logging) {
+            LOG_INFO(Render_Vulkan,
+                     "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={}",
+                     gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory);
+        }
+        return;
+    }
+
+    const bool aggressive = total_used_memory >= critical_gc_memory;
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
     const int max_deletions_allowed = aggressive ? 64 : 32;
     int max_deletions = max_deletions_allowed;
+    int selected_candidates = 0;
     int deleted_buffers = 0;
     int skipped_buffers = 0;
     const auto clean_up = [&](BufferId buffer_id) {
@@ -894,12 +932,19 @@ void BufferCache::RunGarbageCollector() {
         }
 
         Buffer& buffer = slot_buffers[buffer_id];
+        ++selected_candidates;
         if (verbose_gc_logging) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} "
-                     "used={} trigger={} critical={} tick={}",
+                     "used={} trigger={} critical={} tick={} dry_run={}",
                      buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
-                     total_used_memory, trigger_gc_memory, critical_gc_memory, gc_tick);
+                     total_used_memory, trigger_gc_memory, critical_gc_memory, gc_tick,
+                     gc_dry_run);
+        }
+
+        if (gc_dry_run) {
+            --max_deletions;
+            return false;
         }
 
         // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
@@ -907,9 +952,11 @@ void BufferCache::RunGarbageCollector() {
             ++skipped_buffers;
             LOG_WARNING(Render_Vulkan,
                         "Buffer GC skipped eviction due to failed readback: id={} addr={:#x} "
-                        "size={} bytes lru_id={} tick={} used={} trigger={} critical={}",
+                        "size={} bytes lru_id={} tick={} used={} trigger={} critical={} "
+                        "dry_run={}",
                         buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
-                        gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory);
+                        gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory,
+                        gc_dry_run);
             return false;
         }
 
@@ -921,12 +968,14 @@ void BufferCache::RunGarbageCollector() {
 
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (verbose_gc_logging || skipped_buffers > 0) {
+    if (verbose_gc_logging || trace_gc_logging || skipped_buffers > 0 || gc_dry_run) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} aggressive={} used={} trigger={} critical={} "
-                 "max_deletions={} deleted={} skipped={} ticks_to_destroy={}",
+                 "max_deletions={} candidates={} deleted={} skipped={} ticks_to_destroy={} "
+                 "dry_run={} disabled={}",
                  gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
-                 max_deletions_allowed, deleted_buffers, skipped_buffers, ticks_to_destroy);
+                 max_deletions_allowed, selected_candidates, deleted_buffers, skipped_buffers,
+                 ticks_to_destroy, gc_dry_run, gc_disabled);
     }
 }
 
