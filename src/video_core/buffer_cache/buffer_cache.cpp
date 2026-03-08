@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -115,6 +116,45 @@ namespace {
 [[nodiscard]] u64 GetBufferGcIntervalTicks() {
     const u64 interval = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_INTERVAL_TICKS", 16);
     return std::clamp<u64>(interval, 1, 1024);
+}
+
+[[nodiscard]] u64 GetBufferGcSelectIntervalTicks() {
+    const u64 interval = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_SELECT_INTERVAL_TICKS", 32);
+    return std::clamp<u64>(interval, 1, 4096);
+}
+
+[[nodiscard]] int GetBufferGcSelectionQuota(bool aggressive) {
+    const u64 quota = ParseBufferGcEnvU64(aggressive ? "SHADPS4_VK_BUFFER_GC_SELECT_QUOTA_AGGRESSIVE"
+                                                     : "SHADPS4_VK_BUFFER_GC_SELECT_QUOTA",
+                                          aggressive ? 96 : 48);
+    return static_cast<int>(std::clamp<u64>(quota, 8, 2048));
+}
+
+[[nodiscard]] u64 GetBufferGcFastClassBytes() {
+    const u64 mb = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_FAST_CLASS_MB", 4);
+    return std::clamp<u64>(mb, 1, 256) * 1024ULL * 1024ULL;
+}
+
+[[nodiscard]] u64 GetBufferGcProtectTicks() {
+    const u64 ticks = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_PROTECT_TICKS", 512);
+    return std::clamp<u64>(ticks, 32, 16384);
+}
+
+[[nodiscard]] u64 GetBufferGcProtectThreshold() {
+    const u64 hits = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_PROTECT_TOUCHES", 8);
+    return std::clamp<u64>(hits, 2, 64);
+}
+
+[[nodiscard]] u64 GetBufferGcAgeThreshold(bool aggressive) {
+    const u64 ticks = ParseBufferGcEnvU64(aggressive ? "SHADPS4_VK_BUFFER_GC_MIN_AGE_TICKS_AGGRESSIVE"
+                                                     : "SHADPS4_VK_BUFFER_GC_MIN_AGE_TICKS",
+                                          aggressive ? 64 : 160);
+    return std::clamp<u64>(ticks, 8, 4096);
+}
+
+[[nodiscard]] u64 GetBufferGcQueueLimit() {
+    const u64 limit = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_QUEUE_LIMIT", 512);
+    return std::clamp<u64>(limit, 16, 8192);
 }
 
 } // namespace
@@ -824,6 +864,7 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     if constexpr (insert) {
         total_used_memory += Common::AlignUp(size, CACHING_PAGESIZE);
         buffer.SetLRUId(lru_cache.Insert(buffer_id, gc_tick));
+        gc_buffer_meta.erase(buffer.LRUId());
         boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
         bda_addrs.reserve(size_pages);
         for (u64 i = 0; i < size_pages; ++i) {
@@ -836,6 +877,7 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     } else {
         total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
+        gc_buffer_meta.erase(buffer.LRUId());
         const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
         bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
         buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
@@ -1048,14 +1090,6 @@ void BufferCache::RunGarbageCollector() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
-    if (total_used_memory < trigger_gc_memory) {
-        return;
-    }
-
-    const u64 gc_interval_ticks = GetBufferGcIntervalTicks();
-    if ((gc_tick % gc_interval_ticks) != 0) {
-        return;
-    }
 
     const bool verbose_gc_logging = IsBufferGcVerboseLoggingEnabled();
     const bool trace_gc_logging = IsBufferGcTraceLoggingEnabled();
@@ -1075,31 +1109,134 @@ void BufferCache::RunGarbageCollector() {
     const bool gc_readback_only = gc_readback_only_requested;
     const bool gc_delete_only = gc_delete_only_requested && !gc_readback_only_requested;
 
-    if (trace_gc_logging) {
+    const u64 pressure_exit_memory = (trigger_gc_memory * 9ULL) / 10ULL;
+    const u64 critical_exit_memory = (critical_gc_memory * 95ULL) / 100ULL;
+    const GcPressureState previous_state = gc_pressure_state;
+    switch (gc_pressure_state) {
+    case GcPressureState::Idle:
+        if (total_used_memory >= critical_gc_memory) {
+            gc_pressure_state = GcPressureState::Critical;
+        } else if (total_used_memory >= trigger_gc_memory) {
+            gc_pressure_state = GcPressureState::Pressure;
+        }
+        break;
+    case GcPressureState::Pressure:
+        if (total_used_memory >= critical_gc_memory) {
+            gc_pressure_state = GcPressureState::Critical;
+        } else if (total_used_memory < pressure_exit_memory) {
+            gc_pressure_state = GcPressureState::Idle;
+        }
+        break;
+    case GcPressureState::Critical:
+        if (total_used_memory < critical_exit_memory) {
+            gc_pressure_state =
+                (total_used_memory >= trigger_gc_memory) ? GcPressureState::Pressure
+                                                         : GcPressureState::Idle;
+        }
+        break;
+    }
+
+    if (trace_gc_logging && gc_pressure_state != previous_state) {
         LOG_INFO(Render_Vulkan,
-                 "Buffer GC mode: tick={} used={} trigger={} critical={} disabled={} dry_run={} "
-                 "readback_only={} delete_only={} sync_readback={} interval_ticks={}",
-                 gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory, gc_disabled,
-                 gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback,
-                 gc_interval_ticks);
+                 "Buffer GC pressure state transition: tick={} used={} trigger={} critical={} "
+                 "from={} to={}",
+                 gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory,
+                 static_cast<int>(previous_state), static_cast<int>(gc_pressure_state));
     }
 
     if (gc_disabled) {
+        if (!gc_fast_queue.empty() || !gc_slow_queue.empty()) {
+            gc_fast_queue.clear();
+            gc_slow_queue.clear();
+            for (auto& [_, meta] : gc_buffer_meta) {
+                meta.queued = false;
+            }
+        }
         if (trace_gc_logging) {
             LOG_INFO(Render_Vulkan,
-                     "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={} "
-                     "interval_ticks={}",
-                     gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory,
-                     gc_interval_ticks);
+                     "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={}",
+                     gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory);
         }
         return;
     }
 
-    const bool aggressive = total_used_memory >= critical_gc_memory;
-    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
+    if (gc_pressure_state == GcPressureState::Idle) {
+        if (!gc_fast_queue.empty() || !gc_slow_queue.empty()) {
+            gc_fast_queue.clear();
+            gc_slow_queue.clear();
+            for (auto& [_, meta] : gc_buffer_meta) {
+                meta.queued = false;
+            }
+        }
+        return;
+    }
+
+    const bool aggressive = gc_pressure_state == GcPressureState::Critical;
+    const u64 gc_interval_ticks = GetBufferGcIntervalTicks();
+    const u64 gc_select_interval_ticks = GetBufferGcSelectIntervalTicks();
+    const u64 min_age_ticks = std::min<u64>(GetBufferGcAgeThreshold(aggressive), gc_tick);
+    const u64 fast_class_bytes = GetBufferGcFastClassBytes();
+    const u64 queue_limit = GetBufferGcQueueLimit();
+
+    const auto total_queue_size = [&]() {
+        return gc_fast_queue.size() + gc_slow_queue.size();
+    };
+
+    const bool queue_needs_refill = total_queue_size() < 8;
+    const bool should_select =
+        (gc_tick - gc_last_select_tick) >= gc_select_interval_ticks ||
+        (queue_needs_refill && (gc_tick - gc_last_select_tick) >= 4);
+    int queue_selected = 0;
+    int queue_protected_skipped = 0;
+    if (should_select && total_queue_size() < queue_limit) {
+        int selection_quota = GetBufferGcSelectionQuota(aggressive);
+        const u64 tick_threshold = gc_tick - min_age_ticks;
+        lru_cache.ForEachItemBelow(tick_threshold, [&](BufferId buffer_id) {
+            if (selection_quota <= 0 || total_queue_size() >= queue_limit) {
+                return true;
+            }
+            if (IsBufferInvalid(buffer_id)) {
+                return false;
+            }
+
+            Buffer& buffer = slot_buffers[buffer_id];
+            auto& meta = gc_buffer_meta[buffer.LRUId()];
+            if (meta.queued) {
+                return false;
+            }
+            if (meta.protected_until_tick > gc_tick) {
+                ++queue_protected_skipped;
+                return false;
+            }
+
+            auto& target_queue = (buffer.SizeBytes() <= fast_class_bytes) ? gc_fast_queue : gc_slow_queue;
+            target_queue.push_back(buffer_id);
+            meta.queued = true;
+            ++queue_selected;
+            --selection_quota;
+            return false;
+        });
+        gc_last_select_tick = gc_tick;
+    }
+
+    if ((gc_tick % gc_interval_ticks) != 0) {
+        if (trace_gc_logging && (queue_selected > 0 || queue_protected_skipped > 0)) {
+            LOG_INFO(Render_Vulkan,
+                     "Buffer GC select-only tick={} selected={} protected_skipped={} "
+                     "fast_queue={} slow_queue={} interval_ticks={} select_interval_ticks={} "
+                     "state={}",
+                     gc_tick, queue_selected, queue_protected_skipped, gc_fast_queue.size(),
+                     gc_slow_queue.size(), gc_interval_ticks, gc_select_interval_ticks,
+                     static_cast<int>(gc_pressure_state));
+        }
+        return;
+    }
+
     const int max_deletions_allowed = GetBufferGcMaxDeletions(aggressive);
     const u64 readback_budget_bytes = GetBufferGcReadbackBudgetBytes(aggressive);
-    int max_deletions = max_deletions_allowed;
+    const u64 ticks_to_destroy = min_age_ticks;
+
+    int remaining_deletions = max_deletions_allowed;
     int selected_candidates = 0;
     int readback_successes = 0;
     int readback_skipped = 0;
@@ -1108,54 +1245,54 @@ void BufferCache::RunGarbageCollector() {
     int skipped_buffers = 0;
     int budget_limited = 0;
     int oversize_skipped = 0;
+    int protected_skipped = 0;
+    int invalid_skipped = 0;
     u64 readback_bytes_scheduled = 0;
-    const auto clean_up = [&](BufferId buffer_id) {
-        if (max_deletions == 0) {
-            return true;
+
+    const auto process_candidate = [&](BufferId buffer_id) {
+        if (!buffer_id || IsBufferInvalid(buffer_id)) {
+            ++invalid_skipped;
+            return;
         }
 
         Buffer& buffer = slot_buffers[buffer_id];
+        auto& meta = gc_buffer_meta[buffer.LRUId()];
+        meta.queued = false;
+        if (meta.protected_until_tick > gc_tick) {
+            ++protected_skipped;
+            return;
+        }
 
         if (!gc_delete_only && !gc_dry_run) {
             const u64 buffer_size_bytes = buffer.SizeBytes();
             if (buffer_size_bytes > readback_budget_bytes) {
                 ++oversize_skipped;
-                if (verbose_gc_logging) {
-                    LOG_INFO(Render_Vulkan,
-                             "Buffer GC skipping oversize candidate: id={} addr={:#x} size={} "
-                             "bytes budget={} bytes",
-                             buffer_id.index, buffer.CpuAddr(), buffer_size_bytes,
-                             readback_budget_bytes);
-                }
-                return false;
+                return;
             }
-
             const u64 next_readback_bytes = readback_bytes_scheduled + buffer_size_bytes;
             if (readback_bytes_scheduled >= readback_budget_bytes ||
                 (readback_bytes_scheduled > 0 && next_readback_bytes > readback_budget_bytes)) {
                 ++budget_limited;
-                return true;
+                return;
             }
         }
 
         ++selected_candidates;
         if (verbose_gc_logging) {
             LOG_INFO(Render_Vulkan,
-                     "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} "
-                     "used={} trigger={} critical={} tick={} dry_run={} readback_only={} "
-                     "delete_only={} sync_readback={}",
+                     "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} tick={} "
+                     "state={} dry_run={} readback_only={} delete_only={} sync_readback={}",
                      buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
-                     total_used_memory, trigger_gc_memory, critical_gc_memory, gc_tick,
-                     gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback);
+                     gc_tick, static_cast<int>(gc_pressure_state), gc_dry_run,
+                     gc_readback_only, gc_delete_only, gc_sync_readback);
         }
 
+        --remaining_deletions;
         if (gc_dry_run) {
-            --max_deletions;
-            return false;
+            return;
         }
 
         if (!gc_delete_only) {
-            // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
             const bool readback_ok = gc_sync_readback
                                          ? DownloadBufferMemory<false>(
                                                buffer, buffer.CpuAddr(), buffer.SizeBytes(), true)
@@ -1165,73 +1302,100 @@ void BufferCache::RunGarbageCollector() {
                 ++skipped_buffers;
                 LOG_WARNING(Render_Vulkan,
                             "Buffer GC skipped eviction due to failed readback: id={} addr={:#x} "
-                            "size={} bytes lru_id={} tick={} used={} trigger={} critical={} "
-                            "dry_run={} readback_only={} delete_only={} sync_readback={}",
+                            "size={} bytes lru_id={} tick={} used={} state={}",
                             buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(),
-                            buffer.LRUId(), gc_tick, total_used_memory, trigger_gc_memory,
-                            critical_gc_memory, gc_dry_run, gc_readback_only, gc_delete_only,
-                            gc_sync_readback);
-                return false;
+                            buffer.LRUId(), gc_tick, total_used_memory,
+                            static_cast<int>(gc_pressure_state));
+                return;
             }
             ++readback_successes;
             readback_bytes_scheduled += buffer.SizeBytes();
         } else {
             ++readback_skipped;
-            if (verbose_gc_logging) {
-                LOG_INFO(Render_Vulkan,
-                         "Buffer GC delete-only mode: skipping readback for id={} addr={:#x} "
-                         "size={} bytes lru_id={} tick={}",
-                         buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
-                         gc_tick);
-            }
         }
-
-        --max_deletions;
 
         if (gc_readback_only) {
             ++delete_skipped;
-            if (verbose_gc_logging) {
-                LOG_INFO(Render_Vulkan,
-                         "Buffer GC readback-only mode: skipping delete for id={} addr={:#x} "
-                         "size={} bytes lru_id={} tick={}",
-                         buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
-                         gc_tick);
-            }
-            return false;
+            return;
         }
 
         ++deleted_buffers;
         DeleteBuffer(buffer_id);
-        return false;
     };
 
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    while (remaining_deletions > 0) {
+        if (!gc_fast_queue.empty()) {
+            const BufferId next = gc_fast_queue.front();
+            gc_fast_queue.pop_front();
+            process_candidate(next);
+            continue;
+        }
+        if (!gc_slow_queue.empty()) {
+            const BufferId next = gc_slow_queue.front();
+            gc_slow_queue.pop_front();
+            process_candidate(next);
+            continue;
+        }
+        break;
+    }
 
-    if (verbose_gc_logging || trace_gc_logging || skipped_buffers > 0 || gc_dry_run ||
-        gc_readback_only || gc_delete_only || gc_sync_readback || budget_limited > 0 ||
-        oversize_skipped > 0) {
+    if (verbose_gc_logging || trace_gc_logging || selected_candidates > 0 || skipped_buffers > 0 ||
+        budget_limited > 0 || oversize_skipped > 0 || queue_selected > 0 ||
+        queue_protected_skipped > 0 || deleted_buffers > 0 || gc_dry_run ||
+        gc_readback_only || gc_delete_only || gc_sync_readback) {
         LOG_INFO(Render_Vulkan,
-                 "Buffer GC pass: tick={} aggressive={} used={} trigger={} critical={} "
-                 "max_deletions={} candidates={} readback_ok={} readback_skipped={} "
-                 "deleted={} delete_skipped={} skipped={} budget_limited={} "
-                 "oversize_skipped={} readback_bytes={} readback_budget={} "
-                 "ticks_to_destroy={} interval_ticks={} dry_run={} readback_only={} "
-                 "delete_only={} sync_readback={} disabled={}",
-                 gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
-                 max_deletions_allowed, selected_candidates, readback_successes, readback_skipped,
-                 deleted_buffers, delete_skipped, skipped_buffers, budget_limited,
-                 oversize_skipped, readback_bytes_scheduled, readback_budget_bytes,
-                 ticks_to_destroy, gc_interval_ticks, gc_dry_run, gc_readback_only,
-                 gc_delete_only, gc_sync_readback, gc_disabled);
+                 "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
+                 "max_deletions={} selected={} readback_ok={} readback_skipped={} "
+                 "deleted={} delete_skipped={} skipped={} budget_limited={} oversize_skipped={} "
+                 "protected_skipped={} invalid_skipped={} queue_selected={} "
+                 "queue_protected_skipped={} readback_bytes={} readback_budget={} "
+                 "ticks_to_destroy={} interval_ticks={} select_interval_ticks={} "
+                 "fast_queue={} slow_queue={} dry_run={} readback_only={} delete_only={} "
+                 "sync_readback={} disabled={}",
+                 gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
+                 trigger_gc_memory, critical_gc_memory, max_deletions_allowed,
+                 selected_candidates, readback_successes, readback_skipped, deleted_buffers,
+                 delete_skipped, skipped_buffers, budget_limited, oversize_skipped,
+                 protected_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
+                 readback_bytes_scheduled, readback_budget_bytes, ticks_to_destroy,
+                 gc_interval_ticks, gc_select_interval_ticks, gc_fast_queue.size(),
+                 gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
+                 gc_sync_readback, gc_disabled);
+    }
+
+    for (auto it = gc_buffer_meta.begin(); it != gc_buffer_meta.end();) {
+        if (!it->second.queued && it->second.touch_heat == 0 &&
+            it->second.protected_until_tick < gc_tick) {
+            it = gc_buffer_meta.erase(it);
+            continue;
+        }
+        ++it;
     }
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
     lru_cache.Touch(buffer.LRUId(), gc_tick);
+
+    auto& meta = gc_buffer_meta[buffer.LRUId()];
+    if (meta.touch_heat < std::numeric_limits<u8>::max()) {
+        ++meta.touch_heat;
+    }
+
+    const u64 protect_threshold = GetBufferGcProtectThreshold();
+    if (meta.touch_heat >= protect_threshold) {
+        const u64 protect_until = gc_tick + GetBufferGcProtectTicks();
+        meta.protected_until_tick = std::max(meta.protected_until_tick, protect_until);
+        meta.touch_heat = 0;
+    }
 }
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
+    if (auto it = gc_buffer_meta.find(buffer.LRUId()); it != gc_buffer_meta.end()) {
+        it->second.queued = false;
+        it->second.touch_heat = 0;
+        it->second.protected_until_tick = 0;
+    }
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
     buffer.is_deleted = true;

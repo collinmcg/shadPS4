@@ -4,6 +4,8 @@
 #pragma once
 
 #include <boost/container/small_vector.hpp>
+#include <deque>
+#include <unordered_map>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -212,11 +214,28 @@ private:
     StreamBuffer device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
+    enum class GcPressureState : u8 {
+        Idle,
+        Pressure,
+        Critical,
+    };
+
+    struct GcBufferMeta {
+        u8 touch_heat = 0;
+        bool queued = false;
+        u64 protected_until_tick = 0;
+    };
+
     Common::SlotVector<Buffer> slot_buffers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
+    u64 gc_last_select_tick = 0;
+    GcPressureState gc_pressure_state = GcPressureState::Idle;
+    std::deque<BufferId> gc_fast_queue;
+    std::deque<BufferId> gc_slow_queue;
+    std::unordered_map<u64, GcBufferMeta> gc_buffer_meta;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
