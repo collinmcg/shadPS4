@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include <boost/container/small_vector.hpp>
 #include <deque>
 #include <unordered_map>
+#include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -172,7 +172,8 @@ private:
     }
 
     template <bool async>
-    bool DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write);
+    bool DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
+                              bool allow_temporary_download_buffer = true);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 

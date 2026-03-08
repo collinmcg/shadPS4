@@ -252,7 +252,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
+                                       bool allow_temporary_download_buffer) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
@@ -284,6 +285,17 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     vk::Buffer download_dst_buffer = VK_NULL_HANDLE;
 
     if (total_size_bytes > DownloadBufferSize) {
+        if (!allow_temporary_download_buffer) {
+            LOG_INFO(Render_Vulkan,
+                     "Buffer readback deferred: request exceeded staging capacity and temporary "
+                     "fallback is disabled: request={} bytes copies={} staging_cap={} bytes "
+                     "buffer_id={} buffer_addr={:#x} request_addr={:#x} request_size={} bytes "
+                     "(async={}, is_write={})",
+                     total_size_bytes, copies.size(), DownloadBufferSize, buffer.LRUId(),
+                     buffer.CpuAddr(), device_addr, size, async, is_write);
+            return false;
+        }
+
         LOG_INFO(Render_Vulkan,
                  "Buffer readback request exceeded staging capacity, using temporary download "
                  "buffer: request={} bytes copies={} staging_cap={} bytes buffer_id={} "
@@ -1361,6 +1373,10 @@ void BufferCache::RunGarbageCollector() {
             std::min<u64>(base_readback_budget_bytes + adaptive_extra, readback_budget_hard_cap);
     }
 
+    constexpr u64 gc_staging_cap_bytes = DownloadBufferSize;
+    const u64 effective_readback_budget_bytes =
+        std::min<u64>(readback_budget_bytes, gc_staging_cap_bytes);
+
     u64 reclaim_target_bytes = 0;
     if (over_trigger_bytes > 0) {
         constexpr u64 pressure_min_target = 16ULL * 1024ULL * 1024ULL;
@@ -1390,6 +1406,7 @@ void BufferCache::RunGarbageCollector() {
     int protected_skipped = 0;
     int recent_skipped = 0;
     int invalid_skipped = 0;
+    int staging_limited = 0;
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
 
@@ -1416,13 +1433,15 @@ void BufferCache::RunGarbageCollector() {
         }
 
         if (!gc_delete_only && !gc_dry_run) {
-            if (candidate_size_bytes > readback_budget_bytes) {
+            if (candidate_size_bytes > effective_readback_budget_bytes) {
                 ++oversize_skipped;
+                ++staging_limited;
                 return;
             }
             const u64 next_readback_bytes = readback_bytes_scheduled + candidate_size_bytes;
-            if (readback_bytes_scheduled >= readback_budget_bytes ||
-                (readback_bytes_scheduled > 0 && next_readback_bytes > readback_budget_bytes)) {
+            if (readback_bytes_scheduled >= effective_readback_budget_bytes ||
+                (readback_bytes_scheduled > 0 &&
+                 next_readback_bytes > effective_readback_budget_bytes)) {
                 ++budget_limited;
                 return;
             }
@@ -1444,11 +1463,11 @@ void BufferCache::RunGarbageCollector() {
         }
 
         if (!gc_delete_only) {
-            const bool readback_ok = gc_sync_readback
-                                         ? DownloadBufferMemory<false>(buffer, buffer.CpuAddr(),
-                                                                       candidate_size_bytes, true)
-                                         : DownloadBufferMemory<true>(buffer, buffer.CpuAddr(),
-                                                                      candidate_size_bytes, true);
+            const bool readback_ok =
+                gc_sync_readback ? DownloadBufferMemory<false>(buffer, buffer.CpuAddr(),
+                                                               candidate_size_bytes, true, false)
+                                 : DownloadBufferMemory<true>(buffer, buffer.CpuAddr(),
+                                                              candidate_size_bytes, true, false);
             if (!readback_ok) {
                 ++skipped_buffers;
                 LOG_WARNING(Render_Vulkan,
@@ -1518,8 +1537,9 @@ void BufferCache::RunGarbageCollector() {
                  "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
                  "selected={} readback_ok={} readback_skipped={} deleted={} delete_skipped={} "
                  "reclaimed_bytes={} reclaim_target={} skipped={} budget_limited={} "
-                 "oversize_skipped={} protected_skipped={} recent_skipped={} invalid_skipped={} "
-                 "queue_selected={} queue_protected_skipped={} readback_bytes={} "
+                 "oversize_skipped={} staging_limited={} protected_skipped={} "
+                 "recent_skipped={} invalid_skipped={} queue_selected={} "
+                 "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
                  "readback_budget={} base_readback_budget={} ticks_to_destroy={} "
                  "interval_ticks={} base_interval_ticks={} select_interval_ticks={} "
                  "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
@@ -1529,13 +1549,13 @@ void BufferCache::RunGarbageCollector() {
                  max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
                  readback_successes, readback_skipped, deleted_buffers, delete_skipped,
                  reclaimed_bytes, reclaim_target_bytes, skipped_buffers, budget_limited,
-                 oversize_skipped, protected_skipped, recent_skipped, invalid_skipped,
-                 queue_selected, queue_protected_skipped, readback_bytes_scheduled,
-                 readback_budget_bytes, base_readback_budget_bytes, ticks_to_destroy,
-                 gc_interval_ticks, base_gc_interval_ticks, gc_select_interval_ticks,
-                 base_gc_select_interval_ticks, queue_target, gc_fast_queue.size(),
-                 gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
-                 gc_sync_readback, gc_disabled);
+                 oversize_skipped, staging_limited, protected_skipped, recent_skipped,
+                 invalid_skipped, queue_selected, queue_protected_skipped, readback_bytes_scheduled,
+                 effective_readback_budget_bytes, readback_budget_bytes, base_readback_budget_bytes,
+                 ticks_to_destroy, gc_interval_ticks, base_gc_interval_ticks,
+                 gc_select_interval_ticks, base_gc_select_interval_ticks, queue_target,
+                 gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run, gc_readback_only,
+                 gc_delete_only, gc_sync_readback, gc_disabled);
     }
 
     metrics_fast_queue = gc_fast_queue.size();
