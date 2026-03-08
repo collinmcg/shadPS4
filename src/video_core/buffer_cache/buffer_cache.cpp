@@ -112,6 +112,11 @@ namespace {
     return std::clamp<u64>(budget_mb, 8, 1024) * one_mb;
 }
 
+[[nodiscard]] u64 GetBufferGcIntervalTicks() {
+    const u64 interval = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_INTERVAL_TICKS", 16);
+    return std::clamp<u64>(interval, 1, 1024);
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1045,6 +1050,11 @@ void BufferCache::RunGarbageCollector() {
         return;
     }
 
+    const u64 gc_interval_ticks = GetBufferGcIntervalTicks();
+    if ((gc_tick % gc_interval_ticks) != 0) {
+        return;
+    }
+
     const bool verbose_gc_logging = IsBufferGcVerboseLoggingEnabled();
     const bool trace_gc_logging = IsBufferGcTraceLoggingEnabled();
     const bool gc_disabled = IsBufferGcDisabled();
@@ -1066,16 +1076,19 @@ void BufferCache::RunGarbageCollector() {
     if (trace_gc_logging) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC mode: tick={} used={} trigger={} critical={} disabled={} dry_run={} "
-                 "readback_only={} delete_only={} sync_readback={}",
+                 "readback_only={} delete_only={} sync_readback={} interval_ticks={}",
                  gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory, gc_disabled,
-                 gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback);
+                 gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback,
+                 gc_interval_ticks);
     }
 
     if (gc_disabled) {
         if (trace_gc_logging) {
             LOG_INFO(Render_Vulkan,
-                     "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={}",
-                     gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory);
+                     "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={} "
+                     "interval_ticks={}",
+                     gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory,
+                     gc_interval_ticks);
         }
         return;
     }
@@ -1200,14 +1213,14 @@ void BufferCache::RunGarbageCollector() {
                  "max_deletions={} candidates={} readback_ok={} readback_skipped={} "
                  "deleted={} delete_skipped={} skipped={} budget_limited={} "
                  "oversize_skipped={} readback_bytes={} readback_budget={} "
-                 "ticks_to_destroy={} dry_run={} readback_only={} delete_only={} "
-                 "sync_readback={} disabled={}",
+                 "ticks_to_destroy={} interval_ticks={} dry_run={} readback_only={} "
+                 "delete_only={} sync_readback={} disabled={}",
                  gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
                  max_deletions_allowed, selected_candidates, readback_successes, readback_skipped,
                  deleted_buffers, delete_skipped, skipped_buffers, budget_limited,
                  oversize_skipped, readback_bytes_scheduled, readback_budget_bytes,
-                 ticks_to_destroy, gc_dry_run, gc_readback_only, gc_delete_only,
-                 gc_sync_readback, gc_disabled);
+                 ticks_to_destroy, gc_interval_ticks, gc_dry_run, gc_readback_only,
+                 gc_delete_only, gc_sync_readback, gc_disabled);
     }
 }
 
