@@ -3,6 +3,7 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/render_pressure_metrics.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -419,9 +420,13 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
 
     u32 src_layers = src_info.resources.layers;
     u32 dst_layers = dst_info.resources.layers;
+    const auto mark_layer_coercion = [] {
+        Common::RenderPressureMetrics::PublishImageLayerCoercion();
+    };
 
     // 3D images can only use 1 layer.
     if (vk_src_type == vk::ImageType::e3D && src_layers != 1) {
+        mark_layer_coercion();
         LOG_WARNING(Render_Vulkan,
                     "Coercing copy 3D source layers {} to 1 (src_type={} dst_type={} "
                     "src_levels={} src_layers={} dst_levels={} dst_layers={} depth={} "
@@ -433,6 +438,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
         src_layers = 1;
     }
     if (vk_dst_type == vk::ImageType::e3D && dst_layers != 1) {
+        mark_layer_coercion();
         LOG_WARNING(Render_Vulkan,
                     "Coercing copy 3D destination layers {} to 1 (src_type={} dst_type={} "
                     "src_levels={} src_layers={} dst_levels={} dst_layers={} depth={} "
@@ -447,6 +453,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
     // If the image type is equal, layer count must match. Take the minimum of both.
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
+            mark_layer_coercion();
             LOG_WARNING(Render_Vulkan,
                         "Coercing copy source layers {} and destination layers {} to minimum "
                         "(src_type={} dst_type={} src_levels={} src_layers={} dst_levels={} "
@@ -462,6 +469,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
         // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
+            mark_layer_coercion();
             LOG_WARNING(Render_Vulkan,
                         "Coercing copy 2D source layers {} to 3D destination depth {} "
                         "(src_type={} dst_type={} src_levels={} src_layers={} dst_levels={} "
@@ -469,12 +477,12 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
                         src_layers, depth, static_cast<u64>(src_info.type),
                         static_cast<u64>(dst_info.type), src_info.resources.levels,
                         src_info.resources.layers, dst_info.resources.levels,
-                        dst_info.resources.layers, src_info.guest_address,
-                        dst_info.guest_address);
+                        dst_info.resources.layers, src_info.guest_address, dst_info.guest_address);
             src_layers = depth;
         }
         if (vk_src_type == vk::ImageType::e3D && vk_dst_type == vk::ImageType::e2D &&
             dst_layers != depth) {
+            mark_layer_coercion();
             LOG_WARNING(Render_Vulkan,
                         "Coercing copy 2D destination layers {} to 3D source depth {} "
                         "(src_type={} dst_type={} src_levels={} src_layers={} dst_levels={} "
@@ -482,8 +490,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
                         dst_layers, depth, static_cast<u64>(src_info.type),
                         static_cast<u64>(dst_info.type), src_info.resources.levels,
                         src_info.resources.layers, dst_info.resources.levels,
-                        dst_info.resources.layers, src_info.guest_address,
-                        dst_info.guest_address);
+                        dst_info.resources.layers, src_info.guest_address, dst_info.guest_address);
             dst_layers = depth;
         }
     }

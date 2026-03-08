@@ -1262,8 +1262,25 @@ void BufferCache::RunGarbageCollector() {
     }
 
     const bool aggressive = gc_pressure_state == GcPressureState::Critical;
-    const u64 gc_interval_ticks = GetBufferGcIntervalTicks();
-    const u64 gc_select_interval_ticks = GetBufferGcSelectIntervalTicks();
+    const u64 over_trigger_bytes =
+        total_used_memory > trigger_gc_memory ? (total_used_memory - trigger_gc_memory) : 0;
+    const u64 over_critical_bytes =
+        total_used_memory > critical_gc_memory ? (total_used_memory - critical_gc_memory) : 0;
+
+    const u64 base_gc_interval_ticks = GetBufferGcIntervalTicks();
+    u64 gc_interval_ticks = base_gc_interval_ticks;
+    if (aggressive && over_critical_bytes > 0) {
+        constexpr u64 interval_step_bytes = 256ULL * 1024ULL * 1024ULL;
+        const u64 divisor = 1ULL + std::min<u64>(over_critical_bytes / interval_step_bytes, 7ULL);
+        gc_interval_ticks = std::max<u64>(1, base_gc_interval_ticks / divisor);
+    }
+
+    const u64 base_gc_select_interval_ticks = GetBufferGcSelectIntervalTicks();
+    u64 gc_select_interval_ticks = base_gc_select_interval_ticks;
+    if (aggressive) {
+        gc_select_interval_ticks = std::max<u64>(1, base_gc_select_interval_ticks / 2ULL);
+    }
+
     const u64 min_age_ticks = std::min<u64>(GetBufferGcAgeThreshold(aggressive), gc_tick);
     const u64 fast_class_bytes = GetBufferGcFastClassBytes();
     const u64 queue_limit = GetBufferGcQueueLimit();
@@ -1325,8 +1342,40 @@ void BufferCache::RunGarbageCollector() {
         return;
     }
 
-    const int max_deletions_allowed = GetBufferGcMaxDeletions(aggressive);
-    const u64 readback_budget_bytes = GetBufferGcReadbackBudgetBytes(aggressive);
+    const int base_max_deletions_allowed = GetBufferGcMaxDeletions(aggressive);
+    int max_deletions_allowed = base_max_deletions_allowed;
+    if (aggressive && over_critical_bytes > 0) {
+        constexpr u64 deletion_step_bytes = 256ULL * 1024ULL * 1024ULL;
+        const int adaptive_extra =
+            static_cast<int>(std::min<u64>(over_critical_bytes / deletion_step_bytes, 32ULL));
+        max_deletions_allowed = std::min(base_max_deletions_allowed + adaptive_extra, 64);
+    }
+
+    const u64 base_readback_budget_bytes = GetBufferGcReadbackBudgetBytes(aggressive);
+    u64 readback_budget_bytes = base_readback_budget_bytes;
+    if (aggressive && over_critical_bytes > 0) {
+        constexpr u64 max_adaptive_extra = 512ULL * 1024ULL * 1024ULL;
+        const u64 adaptive_extra = std::min<u64>(over_critical_bytes / 2ULL, max_adaptive_extra);
+        constexpr u64 readback_budget_hard_cap = 1024ULL * 1024ULL * 1024ULL;
+        readback_budget_bytes =
+            std::min<u64>(base_readback_budget_bytes + adaptive_extra, readback_budget_hard_cap);
+    }
+
+    u64 reclaim_target_bytes = 0;
+    if (over_trigger_bytes > 0) {
+        constexpr u64 pressure_min_target = 16ULL * 1024ULL * 1024ULL;
+        constexpr u64 pressure_max_target = 128ULL * 1024ULL * 1024ULL;
+        constexpr u64 critical_min_target = 64ULL * 1024ULL * 1024ULL;
+        constexpr u64 critical_max_target = 512ULL * 1024ULL * 1024ULL;
+        if (aggressive) {
+            reclaim_target_bytes = std::clamp<u64>(over_trigger_bytes / 2ULL, critical_min_target,
+                                                   critical_max_target);
+        } else {
+            reclaim_target_bytes = std::clamp<u64>(over_trigger_bytes / 4ULL, pressure_min_target,
+                                                   pressure_max_target);
+        }
+    }
+
     const u64 ticks_to_destroy = min_age_ticks;
 
     int remaining_deletions = max_deletions_allowed;
@@ -1342,6 +1391,7 @@ void BufferCache::RunGarbageCollector() {
     int recent_skipped = 0;
     int invalid_skipped = 0;
     u64 readback_bytes_scheduled = 0;
+    u64 reclaimed_bytes = 0;
 
     const auto process_candidate = [&](BufferId buffer_id) {
         if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -1350,6 +1400,7 @@ void BufferCache::RunGarbageCollector() {
         }
 
         Buffer& buffer = slot_buffers[buffer_id];
+        const u64 candidate_size_bytes = buffer.SizeBytes();
         auto& meta = gc_buffer_meta[buffer.LRUId()];
         meta.queued = false;
         if (meta.protected_until_tick > gc_tick) {
@@ -1365,12 +1416,11 @@ void BufferCache::RunGarbageCollector() {
         }
 
         if (!gc_delete_only && !gc_dry_run) {
-            const u64 buffer_size_bytes = buffer.SizeBytes();
-            if (buffer_size_bytes > readback_budget_bytes) {
+            if (candidate_size_bytes > readback_budget_bytes) {
                 ++oversize_skipped;
                 return;
             }
-            const u64 next_readback_bytes = readback_bytes_scheduled + buffer_size_bytes;
+            const u64 next_readback_bytes = readback_bytes_scheduled + candidate_size_bytes;
             if (readback_bytes_scheduled >= readback_budget_bytes ||
                 (readback_bytes_scheduled > 0 && next_readback_bytes > readback_budget_bytes)) {
                 ++budget_limited;
@@ -1396,20 +1446,20 @@ void BufferCache::RunGarbageCollector() {
         if (!gc_delete_only) {
             const bool readback_ok = gc_sync_readback
                                          ? DownloadBufferMemory<false>(buffer, buffer.CpuAddr(),
-                                                                       buffer.SizeBytes(), true)
+                                                                       candidate_size_bytes, true)
                                          : DownloadBufferMemory<true>(buffer, buffer.CpuAddr(),
-                                                                      buffer.SizeBytes(), true);
+                                                                      candidate_size_bytes, true);
             if (!readback_ok) {
                 ++skipped_buffers;
                 LOG_WARNING(Render_Vulkan,
                             "Buffer GC skipped eviction due to failed readback: id={} addr={:#x} "
                             "size={} bytes lru_id={} tick={} used={} state={}",
-                            buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(),
+                            buffer_id.index, buffer.CpuAddr(), candidate_size_bytes, buffer.LRUId(),
                             gc_tick, total_used_memory, static_cast<int>(gc_pressure_state));
                 return;
             }
             ++readback_successes;
-            readback_bytes_scheduled += buffer.SizeBytes();
+            readback_bytes_scheduled += candidate_size_bytes;
         } else {
             ++readback_skipped;
         }
@@ -1420,23 +1470,43 @@ void BufferCache::RunGarbageCollector() {
         }
 
         ++deleted_buffers;
+        reclaimed_bytes += candidate_size_bytes;
         DeleteBuffer(buffer_id);
     };
 
-    while (remaining_deletions > 0) {
-        if (!gc_fast_queue.empty()) {
-            const BufferId next = gc_fast_queue.front();
-            gc_fast_queue.pop_front();
-            process_candidate(next);
-            continue;
+    const auto queues_not_empty = [&] { return !gc_fast_queue.empty() || !gc_slow_queue.empty(); };
+
+    while (queues_not_empty()) {
+        if (remaining_deletions <= 0) {
+            if (!aggressive || reclaimed_bytes >= reclaim_target_bytes) {
+                break;
+            }
         }
-        if (!gc_slow_queue.empty()) {
-            const BufferId next = gc_slow_queue.front();
-            gc_slow_queue.pop_front();
-            process_candidate(next);
-            continue;
+
+        BufferId next{};
+        if (aggressive) {
+            if (!gc_slow_queue.empty()) {
+                next = gc_slow_queue.front();
+                gc_slow_queue.pop_front();
+            } else if (!gc_fast_queue.empty()) {
+                next = gc_fast_queue.front();
+                gc_fast_queue.pop_front();
+            }
+        } else {
+            if (!gc_fast_queue.empty()) {
+                next = gc_fast_queue.front();
+                gc_fast_queue.pop_front();
+            } else if (!gc_slow_queue.empty()) {
+                next = gc_slow_queue.front();
+                gc_slow_queue.pop_front();
+            }
         }
-        break;
+
+        if (!next) {
+            break;
+        }
+
+        process_candidate(next);
     }
 
     if (verbose_gc_logging || trace_gc_logging || selected_candidates > 0 || skipped_buffers > 0 ||
@@ -1445,20 +1515,25 @@ void BufferCache::RunGarbageCollector() {
         gc_delete_only || gc_sync_readback) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
-                 "max_deletions={} selected={} readback_ok={} readback_skipped={} "
-                 "deleted={} delete_skipped={} skipped={} budget_limited={} oversize_skipped={} "
-                 "protected_skipped={} recent_skipped={} invalid_skipped={} queue_selected={} "
-                 "queue_protected_skipped={} readback_bytes={} readback_budget={} "
-                 "ticks_to_destroy={} interval_ticks={} select_interval_ticks={} "
-                 "queue_target={} fast_queue={} slow_queue={} dry_run={} readback_only={} "
-                 "delete_only={} sync_readback={} disabled={}",
+                 "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
+                 "selected={} readback_ok={} readback_skipped={} deleted={} delete_skipped={} "
+                 "reclaimed_bytes={} reclaim_target={} skipped={} budget_limited={} "
+                 "oversize_skipped={} protected_skipped={} recent_skipped={} invalid_skipped={} "
+                 "queue_selected={} queue_protected_skipped={} readback_bytes={} "
+                 "readback_budget={} base_readback_budget={} ticks_to_destroy={} "
+                 "interval_ticks={} base_interval_ticks={} select_interval_ticks={} "
+                 "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
+                 "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
                  gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
-                 trigger_gc_memory, critical_gc_memory, max_deletions_allowed, selected_candidates,
+                 trigger_gc_memory, critical_gc_memory, over_trigger_bytes, over_critical_bytes,
+                 max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
                  readback_successes, readback_skipped, deleted_buffers, delete_skipped,
-                 skipped_buffers, budget_limited, oversize_skipped, protected_skipped,
-                 recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
-                 readback_bytes_scheduled, readback_budget_bytes, ticks_to_destroy,
-                 gc_interval_ticks, gc_select_interval_ticks, queue_target, gc_fast_queue.size(),
+                 reclaimed_bytes, reclaim_target_bytes, skipped_buffers, budget_limited,
+                 oversize_skipped, protected_skipped, recent_skipped, invalid_skipped,
+                 queue_selected, queue_protected_skipped, readback_bytes_scheduled,
+                 readback_budget_bytes, base_readback_budget_bytes, ticks_to_destroy,
+                 gc_interval_ticks, base_gc_interval_ticks, gc_select_interval_ticks,
+                 base_gc_select_interval_ticks, queue_target, gc_fast_queue.size(),
                  gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
                  gc_sync_readback, gc_disabled);
     }
