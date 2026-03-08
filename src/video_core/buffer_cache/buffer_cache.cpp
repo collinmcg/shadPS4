@@ -227,8 +227,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         download_dst_buffer = download_buffer.Handle();
     }
 
-    const bool force_sync_for_large_readback = static_cast<bool>(temp_download_buffer);
-
     const VAddr buffer_cpu_addr = buffer.CpuAddr();
     const u32 buffer_lru_id = buffer.LRUId();
     const VAddr request_device_addr = device_addr;
@@ -300,12 +298,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     };
 
     if constexpr (async) {
-        if (force_sync_for_large_readback) {
-            scheduler.Finish();
-            write_data();
-        } else {
-            scheduler.DeferOperation(std::move(write_data));
-        }
+        scheduler.DeferOperation(std::move(write_data));
     } else {
         scheduler.Finish();
         write_data();
@@ -1052,7 +1045,10 @@ void BufferCache::RunGarbageCollector() {
 
     const bool aggressive = total_used_memory >= critical_gc_memory;
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
-    const int max_deletions_allowed = aggressive ? 64 : 32;
+    const int max_deletions_allowed = aggressive ? 16 : 8;
+    constexpr u64 normal_readback_budget = 128ULL * 1024ULL * 1024ULL;
+    constexpr u64 aggressive_readback_budget = 256ULL * 1024ULL * 1024ULL;
+    const u64 readback_budget_bytes = aggressive ? aggressive_readback_budget : normal_readback_budget;
     int max_deletions = max_deletions_allowed;
     int selected_candidates = 0;
     int readback_successes = 0;
@@ -1060,8 +1056,15 @@ void BufferCache::RunGarbageCollector() {
     int deleted_buffers = 0;
     int delete_skipped = 0;
     int skipped_buffers = 0;
+    int budget_limited = 0;
+    u64 readback_bytes_scheduled = 0;
     const auto clean_up = [&](BufferId buffer_id) {
         if (max_deletions == 0) {
+            return true;
+        }
+
+        if (!gc_delete_only && !gc_dry_run && readback_bytes_scheduled >= readback_budget_bytes) {
+            ++budget_limited;
             return true;
         }
 
@@ -1102,6 +1105,7 @@ void BufferCache::RunGarbageCollector() {
                 return false;
             }
             ++readback_successes;
+            readback_bytes_scheduled += buffer.SizeBytes();
         } else {
             ++readback_skipped;
             if (verbose_gc_logging) {
@@ -1135,15 +1139,17 @@ void BufferCache::RunGarbageCollector() {
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (verbose_gc_logging || trace_gc_logging || skipped_buffers > 0 || gc_dry_run ||
-        gc_readback_only || gc_delete_only || gc_sync_readback) {
+        gc_readback_only || gc_delete_only || gc_sync_readback || budget_limited > 0) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} aggressive={} used={} trigger={} critical={} "
                  "max_deletions={} candidates={} readback_ok={} readback_skipped={} "
-                 "deleted={} delete_skipped={} skipped={} ticks_to_destroy={} "
-                 "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
+                 "deleted={} delete_skipped={} skipped={} budget_limited={} "
+                 "readback_bytes={} readback_budget={} ticks_to_destroy={} dry_run={} "
+                 "readback_only={} delete_only={} sync_readback={} disabled={}",
                  gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
                  max_deletions_allowed, selected_candidates, readback_successes, readback_skipped,
-                 deleted_buffers, delete_skipped, skipped_buffers, ticks_to_destroy, gc_dry_run,
+                 deleted_buffers, delete_skipped, skipped_buffers, budget_limited,
+                 readback_bytes_scheduled, readback_budget_bytes, ticks_to_destroy, gc_dry_run,
                  gc_readback_only, gc_delete_only, gc_sync_readback, gc_disabled);
     }
 }
