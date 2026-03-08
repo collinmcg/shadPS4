@@ -58,7 +58,7 @@ void Logger::log_flush() {
         return;
     }
 
-    const std::string line = buffer;
+    const std::string line{buffer.begin(), buffer.end()};
     if (is_err) {
         LOG_ERROR(Tty, "[{}] {}", prefix, line);
     } else {
