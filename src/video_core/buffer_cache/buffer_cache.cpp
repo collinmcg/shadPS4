@@ -75,6 +75,43 @@ namespace {
     return enabled;
 }
 
+[[nodiscard]] u64 ParseBufferGcEnvU64(const char* name, u64 fallback) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const auto parsed = std::strtoull(value, &end_ptr, 10);
+    if (end_ptr == value) {
+        return fallback;
+    }
+    return static_cast<u64>(parsed);
+}
+
+[[nodiscard]] int GetBufferGcMaxDeletions(bool aggressive) {
+    constexpr int normal_default = 4;
+    constexpr int aggressive_default = 8;
+
+    const u64 parsed = ParseBufferGcEnvU64(
+        aggressive ? "SHADPS4_VK_BUFFER_GC_MAX_DELETIONS_AGGRESSIVE"
+                   : "SHADPS4_VK_BUFFER_GC_MAX_DELETIONS",
+        aggressive ? aggressive_default : normal_default);
+    return static_cast<int>(std::clamp<u64>(parsed, 1, 64));
+}
+
+[[nodiscard]] u64 GetBufferGcReadbackBudgetBytes(bool aggressive) {
+    constexpr u64 normal_default_mb = 64;
+    constexpr u64 aggressive_default_mb = 96;
+
+    const u64 budget_mb = ParseBufferGcEnvU64(
+        aggressive ? "SHADPS4_VK_BUFFER_GC_READBACK_BUDGET_MB_AGGRESSIVE"
+                   : "SHADPS4_VK_BUFFER_GC_READBACK_BUDGET_MB",
+        aggressive ? aggressive_default_mb : normal_default_mb);
+    constexpr u64 one_mb = 1024ULL * 1024ULL;
+    return std::clamp<u64>(budget_mb, 8, 1024) * one_mb;
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1045,10 +1082,8 @@ void BufferCache::RunGarbageCollector() {
 
     const bool aggressive = total_used_memory >= critical_gc_memory;
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
-    const int max_deletions_allowed = aggressive ? 16 : 8;
-    constexpr u64 normal_readback_budget = 128ULL * 1024ULL * 1024ULL;
-    constexpr u64 aggressive_readback_budget = 256ULL * 1024ULL * 1024ULL;
-    const u64 readback_budget_bytes = aggressive ? aggressive_readback_budget : normal_readback_budget;
+    const int max_deletions_allowed = GetBufferGcMaxDeletions(aggressive);
+    const u64 readback_budget_bytes = GetBufferGcReadbackBudgetBytes(aggressive);
     int max_deletions = max_deletions_allowed;
     int selected_candidates = 0;
     int readback_successes = 0;
@@ -1063,12 +1098,17 @@ void BufferCache::RunGarbageCollector() {
             return true;
         }
 
-        if (!gc_delete_only && !gc_dry_run && readback_bytes_scheduled >= readback_budget_bytes) {
-            ++budget_limited;
-            return true;
+        Buffer& buffer = slot_buffers[buffer_id];
+
+        if (!gc_delete_only && !gc_dry_run) {
+            const u64 next_readback_bytes = readback_bytes_scheduled + buffer.SizeBytes();
+            if (readback_bytes_scheduled >= readback_budget_bytes ||
+                (readback_bytes_scheduled > 0 && next_readback_bytes > readback_budget_bytes)) {
+                ++budget_limited;
+                return true;
+            }
         }
 
-        Buffer& buffer = slot_buffers[buffer_id];
         ++selected_candidates;
         if (verbose_gc_logging) {
             LOG_INFO(Render_Vulkan,
