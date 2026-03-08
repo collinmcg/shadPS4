@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/gc_metrics.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
@@ -72,6 +74,17 @@ namespace {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_SYNC_READBACK");
         return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool IsBufferGcMetricsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_METRICS");
+        if (!value || value[0] == '\0') {
+            return true;
+        }
+        return value[0] != '0';
     }();
     return enabled;
 }
@@ -1096,6 +1109,73 @@ void BufferCache::RunGarbageCollector() {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
 
+    const bool metrics_enabled = IsBufferGcMetricsEnabled();
+    const auto gc_pass_start = std::chrono::steady_clock::now();
+    u64 metrics_state = static_cast<u64>(gc_pressure_state);
+    u64 metrics_fast_queue = gc_fast_queue.size();
+    u64 metrics_slow_queue = gc_slow_queue.size();
+    u64 metrics_selected = 0;
+    u64 metrics_deleted = 0;
+    u64 metrics_skipped = 0;
+    u64 metrics_readback_bytes = 0;
+
+    SCOPE_EXIT {
+        if (!metrics_enabled) {
+            return;
+        }
+        using namespace std::chrono;
+        const auto now = steady_clock::now();
+        const u64 pass_duration_us =
+            static_cast<u64>(duration_cast<microseconds>(now - gc_pass_start).count());
+        Common::GcMetrics::PublishPass(gc_tick, metrics_state, total_used_memory, metrics_fast_queue,
+                                       metrics_slow_queue, metrics_selected, metrics_deleted,
+                                       metrics_skipped, metrics_readback_bytes, pass_duration_us);
+
+        static u64 window_start_ms = 0;
+        static u64 window_passes = 0;
+        static u64 window_bytes = 0;
+        static u64 window_duration_us = 0;
+        static u64 window_max_us = 0;
+
+        const u64 now_ms = static_cast<u64>(
+            duration_cast<milliseconds>(now.time_since_epoch()).count());
+        if (window_start_ms == 0) {
+            window_start_ms = now_ms;
+        }
+
+        ++window_passes;
+        window_bytes += metrics_readback_bytes;
+        window_duration_us += pass_duration_us;
+        window_max_us = std::max(window_max_us, pass_duration_us);
+
+        const u64 window_ms = now_ms - window_start_ms;
+        if (window_ms >= 1000) {
+            const u64 safe_window_ms = std::max<u64>(window_ms, 1);
+            const u64 passes_per_sec = (window_passes * 1000ULL) / safe_window_ms;
+            const u64 readback_mb_per_sec =
+                ((window_bytes * 1000ULL) / safe_window_ms) / (1024ULL * 1024ULL);
+            const u64 avg_pass_us =
+                window_passes ? (window_duration_us / window_passes) : 0;
+
+            Common::GcMetrics::PublishRolling(passes_per_sec, readback_mb_per_sec, avg_pass_us,
+                                              window_max_us);
+
+            LOG_INFO(Render_Vulkan,
+                     "Buffer GC rolling: window_ms={} passes={} passes_s={} readback_mb_s={} "
+                     "avg_pass_us={} max_pass_us={} state={} used_mb={} fast_q={} slow_q={}",
+                     safe_window_ms, window_passes, passes_per_sec, readback_mb_per_sec,
+                     avg_pass_us, window_max_us, metrics_state,
+                     total_used_memory / (1024ULL * 1024ULL), metrics_fast_queue,
+                     metrics_slow_queue);
+
+            window_start_ms = now_ms;
+            window_passes = 0;
+            window_bytes = 0;
+            window_duration_us = 0;
+            window_max_us = 0;
+        }
+    };
+
     const bool verbose_gc_logging = IsBufferGcVerboseLoggingEnabled();
     const bool trace_gc_logging = IsBufferGcTraceLoggingEnabled();
     const bool gc_disabled = IsBufferGcDisabled();
@@ -1148,6 +1228,7 @@ void BufferCache::RunGarbageCollector() {
                  gc_tick, total_used_memory, trigger_gc_memory, critical_gc_memory,
                  static_cast<int>(previous_state), static_cast<int>(gc_pressure_state));
     }
+    metrics_state = static_cast<u64>(gc_pressure_state);
 
     if (gc_disabled) {
         if (!gc_fast_queue.empty() || !gc_slow_queue.empty()) {
@@ -1157,6 +1238,8 @@ void BufferCache::RunGarbageCollector() {
                 meta.queued = false;
             }
         }
+        metrics_fast_queue = gc_fast_queue.size();
+        metrics_slow_queue = gc_slow_queue.size();
         if (trace_gc_logging) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC pass skipped (disabled): tick={} used={} trigger={} critical={}",
@@ -1173,6 +1256,8 @@ void BufferCache::RunGarbageCollector() {
                 meta.queued = false;
             }
         }
+        metrics_fast_queue = gc_fast_queue.size();
+        metrics_slow_queue = gc_slow_queue.size();
         return;
     }
 
@@ -1228,6 +1313,8 @@ void BufferCache::RunGarbageCollector() {
     }
 
     if ((gc_tick % gc_interval_ticks) != 0) {
+        metrics_fast_queue = gc_fast_queue.size();
+        metrics_slow_queue = gc_slow_queue.size();
         if (trace_gc_logging && (queue_selected > 0 || queue_protected_skipped > 0)) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC select-only tick={} selected={} protected_skipped={} "
@@ -1378,6 +1465,14 @@ void BufferCache::RunGarbageCollector() {
                  gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run, gc_readback_only,
                  gc_delete_only, gc_sync_readback, gc_disabled);
     }
+
+    metrics_fast_queue = gc_fast_queue.size();
+    metrics_slow_queue = gc_slow_queue.size();
+    metrics_selected = selected_candidates;
+    metrics_deleted = deleted_buffers;
+    metrics_skipped = skipped_buffers + budget_limited + oversize_skipped + protected_skipped +
+                      recent_skipped + invalid_skipped;
+    metrics_readback_bytes = readback_bytes_scheduled;
 
     for (auto it = gc_buffer_meta.begin(); it != gc_buffer_meta.end();) {
         if (!it->second.queued && it->second.touch_heat == 0 &&
