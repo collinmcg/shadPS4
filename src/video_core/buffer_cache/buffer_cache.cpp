@@ -157,6 +157,11 @@ namespace {
     return std::clamp<u64>(limit, 16, 8192);
 }
 
+[[nodiscard]] u64 GetBufferGcQueueTarget(u64 queue_limit) {
+    const u64 target = ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_QUEUE_TARGET", 96);
+    return std::clamp<u64>(target, 8, queue_limit);
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1177,22 +1182,25 @@ void BufferCache::RunGarbageCollector() {
     const u64 min_age_ticks = std::min<u64>(GetBufferGcAgeThreshold(aggressive), gc_tick);
     const u64 fast_class_bytes = GetBufferGcFastClassBytes();
     const u64 queue_limit = GetBufferGcQueueLimit();
+    const u64 queue_target = GetBufferGcQueueTarget(queue_limit);
 
     const auto total_queue_size = [&]() {
         return gc_fast_queue.size() + gc_slow_queue.size();
     };
 
     const bool queue_needs_refill = total_queue_size() < 8;
+    const bool queue_below_target = total_queue_size() < queue_target;
     const bool should_select =
-        (gc_tick - gc_last_select_tick) >= gc_select_interval_ticks ||
-        (queue_needs_refill && (gc_tick - gc_last_select_tick) >= 4);
+        queue_below_target &&
+        ((gc_tick - gc_last_select_tick) >= gc_select_interval_ticks ||
+         (queue_needs_refill && (gc_tick - gc_last_select_tick) >= 4));
     int queue_selected = 0;
     int queue_protected_skipped = 0;
-    if (should_select && total_queue_size() < queue_limit) {
+    if (should_select && total_queue_size() < queue_target) {
         int selection_quota = GetBufferGcSelectionQuota(aggressive);
         const u64 tick_threshold = gc_tick - min_age_ticks;
         lru_cache.ForEachItemBelow(tick_threshold, [&](BufferId buffer_id) {
-            if (selection_quota <= 0 || total_queue_size() >= queue_limit) {
+            if (selection_quota <= 0 || total_queue_size() >= queue_target) {
                 return true;
             }
             if (IsBufferInvalid(buffer_id)) {
@@ -1246,6 +1254,7 @@ void BufferCache::RunGarbageCollector() {
     int budget_limited = 0;
     int oversize_skipped = 0;
     int protected_skipped = 0;
+    int recent_skipped = 0;
     int invalid_skipped = 0;
     u64 readback_bytes_scheduled = 0;
 
@@ -1260,6 +1269,13 @@ void BufferCache::RunGarbageCollector() {
         meta.queued = false;
         if (meta.protected_until_tick > gc_tick) {
             ++protected_skipped;
+            return;
+        }
+
+        const s64 age_delta = static_cast<s64>(gc_tick) -
+                              static_cast<s64>(lru_cache.GetTick(buffer.LRUId()));
+        if (age_delta < static_cast<s64>(min_age_ticks)) {
+            ++recent_skipped;
             return;
         }
 
@@ -1347,20 +1363,20 @@ void BufferCache::RunGarbageCollector() {
                  "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
                  "max_deletions={} selected={} readback_ok={} readback_skipped={} "
                  "deleted={} delete_skipped={} skipped={} budget_limited={} oversize_skipped={} "
-                 "protected_skipped={} invalid_skipped={} queue_selected={} "
+                 "protected_skipped={} recent_skipped={} invalid_skipped={} queue_selected={} "
                  "queue_protected_skipped={} readback_bytes={} readback_budget={} "
                  "ticks_to_destroy={} interval_ticks={} select_interval_ticks={} "
-                 "fast_queue={} slow_queue={} dry_run={} readback_only={} delete_only={} "
-                 "sync_readback={} disabled={}",
+                 "queue_target={} fast_queue={} slow_queue={} dry_run={} readback_only={} "
+                 "delete_only={} sync_readback={} disabled={}",
                  gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
                  trigger_gc_memory, critical_gc_memory, max_deletions_allowed,
                  selected_candidates, readback_successes, readback_skipped, deleted_buffers,
                  delete_skipped, skipped_buffers, budget_limited, oversize_skipped,
-                 protected_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
-                 readback_bytes_scheduled, readback_budget_bytes, ticks_to_destroy,
-                 gc_interval_ticks, gc_select_interval_ticks, gc_fast_queue.size(),
-                 gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
-                 gc_sync_readback, gc_disabled);
+                 protected_skipped, recent_skipped, invalid_skipped, queue_selected,
+                 queue_protected_skipped, readback_bytes_scheduled, readback_budget_bytes,
+                 ticks_to_destroy, gc_interval_ticks, gc_select_interval_ticks, queue_target,
+                 gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run, gc_readback_only,
+                 gc_delete_only, gc_sync_readback, gc_disabled);
     }
 
     for (auto it = gc_buffer_meta.begin(); it != gc_buffer_meta.end();) {
