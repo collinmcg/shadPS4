@@ -177,6 +177,14 @@ namespace {
     return std::clamp<u64>(target, 8, queue_limit);
 }
 
+[[nodiscard]] u64 GetBufferGcRetireTicks(bool aggressive) {
+    const u64 ticks =
+        ParseBufferGcEnvU64(aggressive ? "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_AGGRESSIVE"
+                                       : "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS",
+                            aggressive ? 128 : 128);
+    return std::clamp<u64>(ticks, 16, 4096);
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1307,6 +1315,7 @@ void BufferCache::RunGarbageCollector() {
                                (queue_needs_refill && (gc_tick - gc_last_select_tick) >= 4));
     int queue_selected = 0;
     int queue_protected_skipped = 0;
+    int queue_retire_waiting = 0;
     if (should_select && total_queue_size() < queue_target) {
         int selection_quota = GetBufferGcSelectionQuota(aggressive);
         const u64 tick_threshold = gc_tick - min_age_ticks;
@@ -1321,6 +1330,20 @@ void BufferCache::RunGarbageCollector() {
             Buffer& buffer = slot_buffers[buffer_id];
             auto& meta = gc_buffer_meta[buffer.LRUId()];
             if (meta.queued) {
+                return false;
+            }
+            if (meta.retired) {
+                if (meta.retire_ready_tick > gc_tick) {
+                    ++queue_retire_waiting;
+                    return false;
+                }
+
+                auto& target_queue =
+                    (buffer.SizeBytes() <= fast_class_bytes) ? gc_fast_queue : gc_slow_queue;
+                target_queue.push_front(buffer_id);
+                meta.queued = true;
+                ++queue_selected;
+                --selection_quota;
                 return false;
             }
             if (meta.protected_until_tick > gc_tick) {
@@ -1345,11 +1368,11 @@ void BufferCache::RunGarbageCollector() {
         if (trace_gc_logging && (queue_selected > 0 || queue_protected_skipped > 0)) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC select-only tick={} selected={} protected_skipped={} "
-                     "fast_queue={} slow_queue={} interval_ticks={} select_interval_ticks={} "
-                     "state={}",
-                     gc_tick, queue_selected, queue_protected_skipped, gc_fast_queue.size(),
-                     gc_slow_queue.size(), gc_interval_ticks, gc_select_interval_ticks,
-                     static_cast<int>(gc_pressure_state));
+                     "retire_waiting={} fast_queue={} slow_queue={} interval_ticks={} "
+                     "select_interval_ticks={} state={}",
+                     gc_tick, queue_selected, queue_protected_skipped, queue_retire_waiting,
+                     gc_fast_queue.size(), gc_slow_queue.size(), gc_interval_ticks,
+                     gc_select_interval_ticks, static_cast<int>(gc_pressure_state));
         }
         return;
     }
@@ -1407,8 +1430,11 @@ void BufferCache::RunGarbageCollector() {
     int recent_skipped = 0;
     int invalid_skipped = 0;
     int staging_limited = 0;
+    int retired_buffers = 0;
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
+
+    const u64 retire_ticks = GetBufferGcRetireTicks(aggressive);
 
     const auto process_candidate = [&](BufferId buffer_id) {
         if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -1420,19 +1446,22 @@ void BufferCache::RunGarbageCollector() {
         const u64 candidate_size_bytes = buffer.SizeBytes();
         auto& meta = gc_buffer_meta[buffer.LRUId()];
         meta.queued = false;
-        if (meta.protected_until_tick > gc_tick) {
+        const bool retired_candidate = meta.retired && meta.retire_ready_tick <= gc_tick;
+        if (!retired_candidate && meta.protected_until_tick > gc_tick) {
             ++protected_skipped;
             return;
         }
 
-        const s64 age_delta =
-            static_cast<s64>(gc_tick) - static_cast<s64>(lru_cache.GetTick(buffer.LRUId()));
-        if (age_delta < static_cast<s64>(min_age_ticks)) {
-            ++recent_skipped;
-            return;
+        if (!retired_candidate) {
+            const s64 age_delta =
+                static_cast<s64>(gc_tick) - static_cast<s64>(lru_cache.GetTick(buffer.LRUId()));
+            if (age_delta < static_cast<s64>(min_age_ticks)) {
+                ++recent_skipped;
+                return;
+            }
         }
 
-        if (!gc_delete_only && !gc_dry_run) {
+        if (!retired_candidate && !gc_delete_only && !gc_dry_run) {
             if (candidate_size_bytes > effective_readback_budget_bytes) {
                 ++oversize_skipped;
                 ++staging_limited;
@@ -1451,10 +1480,11 @@ void BufferCache::RunGarbageCollector() {
         if (verbose_gc_logging) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} tick={} "
-                     "state={} dry_run={} readback_only={} delete_only={} sync_readback={}",
+                     "state={} retired={} dry_run={} readback_only={} delete_only={} "
+                     "sync_readback={}",
                      buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(), gc_tick,
-                     static_cast<int>(gc_pressure_state), gc_dry_run, gc_readback_only,
-                     gc_delete_only, gc_sync_readback);
+                     static_cast<int>(gc_pressure_state), retired_candidate, gc_dry_run,
+                     gc_readback_only, gc_delete_only, gc_sync_readback);
         }
 
         --remaining_deletions;
@@ -1462,7 +1492,7 @@ void BufferCache::RunGarbageCollector() {
             return;
         }
 
-        if (!gc_delete_only) {
+        if (!retired_candidate && !gc_delete_only) {
             const bool readback_ok =
                 gc_sync_readback ? DownloadBufferMemory<false>(buffer, buffer.CpuAddr(),
                                                                candidate_size_bytes, true, false)
@@ -1488,6 +1518,16 @@ void BufferCache::RunGarbageCollector() {
             return;
         }
 
+        if (!retired_candidate && !gc_delete_only) {
+            meta.retired = true;
+            meta.retire_ready_tick = gc_tick + retire_ticks;
+            meta.touch_heat = 0;
+            ++retired_buffers;
+            return;
+        }
+
+        meta.retired = false;
+        meta.retire_ready_tick = 0;
         ++deleted_buffers;
         reclaimed_bytes += candidate_size_bytes;
         DeleteBuffer(buffer_id);
@@ -1535,27 +1575,27 @@ void BufferCache::RunGarbageCollector() {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
                  "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
-                 "selected={} readback_ok={} readback_skipped={} deleted={} delete_skipped={} "
-                 "reclaimed_bytes={} reclaim_target={} skipped={} budget_limited={} "
-                 "oversize_skipped={} staging_limited={} protected_skipped={} "
+                 "selected={} readback_ok={} readback_skipped={} retired={} deleted={} "
+                 "delete_skipped={} reclaimed_bytes={} reclaim_target={} skipped={} "
+                 "budget_limited={} oversize_skipped={} staging_limited={} protected_skipped={} "
                  "recent_skipped={} invalid_skipped={} queue_selected={} "
                  "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
-                 "readback_budget={} base_readback_budget={} ticks_to_destroy={} "
+                 "readback_budget={} base_readback_budget={} retire_ticks={} ticks_to_destroy={} "
                  "interval_ticks={} base_interval_ticks={} select_interval_ticks={} "
                  "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
                  "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
                  gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
                  trigger_gc_memory, critical_gc_memory, over_trigger_bytes, over_critical_bytes,
                  max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
-                 readback_successes, readback_skipped, deleted_buffers, delete_skipped,
-                 reclaimed_bytes, reclaim_target_bytes, skipped_buffers, budget_limited,
-                 oversize_skipped, staging_limited, protected_skipped, recent_skipped,
-                 invalid_skipped, queue_selected, queue_protected_skipped, readback_bytes_scheduled,
-                 effective_readback_budget_bytes, readback_budget_bytes, base_readback_budget_bytes,
-                 ticks_to_destroy, gc_interval_ticks, base_gc_interval_ticks,
-                 gc_select_interval_ticks, base_gc_select_interval_ticks, queue_target,
-                 gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run, gc_readback_only,
-                 gc_delete_only, gc_sync_readback, gc_disabled);
+                 readback_successes, readback_skipped, retired_buffers, deleted_buffers,
+                 delete_skipped, reclaimed_bytes, reclaim_target_bytes, skipped_buffers,
+                 budget_limited, oversize_skipped, staging_limited, protected_skipped,
+                 recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
+                 readback_bytes_scheduled, effective_readback_budget_bytes, readback_budget_bytes,
+                 base_readback_budget_bytes, retire_ticks, ticks_to_destroy, gc_interval_ticks,
+                 base_gc_interval_ticks, gc_select_interval_ticks, base_gc_select_interval_ticks,
+                 queue_target, gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run,
+                 gc_readback_only, gc_delete_only, gc_sync_readback, gc_disabled);
     }
 
     metrics_fast_queue = gc_fast_queue.size();
@@ -1567,7 +1607,7 @@ void BufferCache::RunGarbageCollector() {
     metrics_readback_bytes = readback_bytes_scheduled;
 
     for (auto it = gc_buffer_meta.begin(); it != gc_buffer_meta.end();) {
-        if (!it->second.queued && it->second.touch_heat == 0 &&
+        if (!it->second.queued && !it->second.retired && it->second.touch_heat == 0 &&
             it->second.protected_until_tick < gc_tick) {
             it = gc_buffer_meta.erase(it);
             continue;
@@ -1580,6 +1620,10 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
     lru_cache.Touch(buffer.LRUId(), gc_tick);
 
     auto& meta = gc_buffer_meta[buffer.LRUId()];
+    if (meta.retired) {
+        meta.retired = false;
+        meta.retire_ready_tick = 0;
+    }
     if (meta.touch_heat < std::numeric_limits<u8>::max()) {
         ++meta.touch_heat;
     }
@@ -1596,8 +1640,10 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     if (auto it = gc_buffer_meta.find(buffer.LRUId()); it != gc_buffer_meta.end()) {
         it->second.queued = false;
+        it->second.retired = false;
         it->second.touch_heat = 0;
         it->second.protected_until_tick = 0;
+        it->second.retire_ready_tick = 0;
     }
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });

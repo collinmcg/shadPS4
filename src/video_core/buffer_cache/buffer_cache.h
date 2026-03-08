@@ -224,7 +224,9 @@ private:
     struct GcBufferMeta {
         u8 touch_heat = 0;
         bool queued = false;
+        bool retired = false;
         u64 protected_until_tick = 0;
+        u64 retire_ready_tick = 0;
     };
 
     Common::SlotVector<Buffer> slot_buffers;
