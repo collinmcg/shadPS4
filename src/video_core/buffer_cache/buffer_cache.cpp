@@ -102,7 +102,7 @@ namespace {
 
 [[nodiscard]] u64 GetBufferGcReadbackBudgetBytes(bool aggressive) {
     constexpr u64 normal_default_mb = 64;
-    constexpr u64 aggressive_default_mb = 96;
+    constexpr u64 aggressive_default_mb = 64;
 
     const u64 budget_mb = ParseBufferGcEnvU64(
         aggressive ? "SHADPS4_VK_BUFFER_GC_READBACK_BUDGET_MB_AGGRESSIVE"
@@ -1092,6 +1092,7 @@ void BufferCache::RunGarbageCollector() {
     int delete_skipped = 0;
     int skipped_buffers = 0;
     int budget_limited = 0;
+    int oversize_skipped = 0;
     u64 readback_bytes_scheduled = 0;
     const auto clean_up = [&](BufferId buffer_id) {
         if (max_deletions == 0) {
@@ -1101,7 +1102,20 @@ void BufferCache::RunGarbageCollector() {
         Buffer& buffer = slot_buffers[buffer_id];
 
         if (!gc_delete_only && !gc_dry_run) {
-            const u64 next_readback_bytes = readback_bytes_scheduled + buffer.SizeBytes();
+            const u64 buffer_size_bytes = buffer.SizeBytes();
+            if (buffer_size_bytes > readback_budget_bytes) {
+                ++oversize_skipped;
+                if (verbose_gc_logging) {
+                    LOG_INFO(Render_Vulkan,
+                             "Buffer GC skipping oversize candidate: id={} addr={:#x} size={} "
+                             "bytes budget={} bytes",
+                             buffer_id.index, buffer.CpuAddr(), buffer_size_bytes,
+                             readback_budget_bytes);
+                }
+                return false;
+            }
+
+            const u64 next_readback_bytes = readback_bytes_scheduled + buffer_size_bytes;
             if (readback_bytes_scheduled >= readback_budget_bytes ||
                 (readback_bytes_scheduled > 0 && next_readback_bytes > readback_budget_bytes)) {
                 ++budget_limited;
@@ -1179,18 +1193,21 @@ void BufferCache::RunGarbageCollector() {
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (verbose_gc_logging || trace_gc_logging || skipped_buffers > 0 || gc_dry_run ||
-        gc_readback_only || gc_delete_only || gc_sync_readback || budget_limited > 0) {
+        gc_readback_only || gc_delete_only || gc_sync_readback || budget_limited > 0 ||
+        oversize_skipped > 0) {
         LOG_INFO(Render_Vulkan,
                  "Buffer GC pass: tick={} aggressive={} used={} trigger={} critical={} "
                  "max_deletions={} candidates={} readback_ok={} readback_skipped={} "
                  "deleted={} delete_skipped={} skipped={} budget_limited={} "
-                 "readback_bytes={} readback_budget={} ticks_to_destroy={} dry_run={} "
-                 "readback_only={} delete_only={} sync_readback={} disabled={}",
+                 "oversize_skipped={} readback_bytes={} readback_budget={} "
+                 "ticks_to_destroy={} dry_run={} readback_only={} delete_only={} "
+                 "sync_readback={} disabled={}",
                  gc_tick, aggressive, total_used_memory, trigger_gc_memory, critical_gc_memory,
                  max_deletions_allowed, selected_candidates, readback_successes, readback_skipped,
                  deleted_buffers, delete_skipped, skipped_buffers, budget_limited,
-                 readback_bytes_scheduled, readback_budget_bytes, ticks_to_destroy, gc_dry_run,
-                 gc_readback_only, gc_delete_only, gc_sync_readback, gc_disabled);
+                 oversize_skipped, readback_bytes_scheduled, readback_budget_bytes,
+                 ticks_to_destroy, gc_dry_run, gc_readback_only, gc_delete_only,
+                 gc_sync_readback, gc_disabled);
     }
 }
 
