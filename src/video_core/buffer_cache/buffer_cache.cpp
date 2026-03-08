@@ -592,6 +592,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
+    TouchBuffer(buffer);
     return {&buffer, buffer.Offset(device_addr)};
 }
 
@@ -601,6 +602,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
             SynchronizeBuffer(buffer, gpu_addr, size, false, false);
+            TouchBuffer(buffer);
             return {&buffer, buffer.Offset(gpu_addr)};
         }
     }
