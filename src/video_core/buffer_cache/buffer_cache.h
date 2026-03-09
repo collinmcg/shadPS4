@@ -227,6 +227,8 @@ private:
         bool retired = false;
         u64 protected_until_tick = 0;
         u64 retire_ready_tick = 0;
+        u64 last_use_submit_tick = 0;
+        u64 retire_submit_tick = 0;
     };
 
     Common::SlotVector<Buffer> slot_buffers;
