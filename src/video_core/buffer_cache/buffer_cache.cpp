@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -37,6 +38,13 @@ namespace {
     }();
     return enabled;
 }
+
+inline std::atomic<u64> g_gc_deferred_destroy_enqueued{};
+inline std::atomic<u64> g_gc_deferred_destroy_enqueued_bytes{};
+inline std::atomic<u64> g_gc_deferred_destroy_executed{};
+inline std::atomic<u64> g_gc_deferred_destroy_executed_bytes{};
+inline std::atomic<u64> g_gc_deferred_destroy_canceled{};
+inline std::atomic<u64> g_gc_deferred_destroy_reactivated{};
 
 [[nodiscard]] bool IsBufferGcDisabled() {
     static const bool disabled = [] {
@@ -1491,6 +1499,18 @@ void BufferCache::RunGarbageCollector() {
     int fence_delete_deferred = 0;
     int critical_delete_deferred = 0;
     int large_delete_deferred = 0;
+    const u64 deferred_destroy_enqueued =
+        g_gc_deferred_destroy_enqueued.load(std::memory_order_relaxed);
+    const u64 deferred_destroy_enqueued_bytes =
+        g_gc_deferred_destroy_enqueued_bytes.load(std::memory_order_relaxed);
+    const u64 deferred_destroy_executed =
+        g_gc_deferred_destroy_executed.load(std::memory_order_relaxed);
+    const u64 deferred_destroy_executed_bytes =
+        g_gc_deferred_destroy_executed_bytes.load(std::memory_order_relaxed);
+    const u64 deferred_destroy_canceled =
+        g_gc_deferred_destroy_canceled.load(std::memory_order_relaxed);
+    const u64 deferred_destroy_reactivated =
+        g_gc_deferred_destroy_reactivated.load(std::memory_order_relaxed);
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
 
@@ -1700,7 +1720,9 @@ void BufferCache::RunGarbageCollector() {
             "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
             "selected={} readback_ok={} readback_skipped={} retired={} deleted={} "
             "delete_skipped={} retired_delete_deferred={} fence_delete_deferred={} "
-            "critical_delete_deferred={} large_delete_deferred={} reclaimed_bytes={} "
+            "critical_delete_deferred={} large_delete_deferred={} deferred_enqueued={} "
+            "deferred_executed={} deferred_canceled={} deferred_reactivated={} "
+            "deferred_enqueued_mb={} deferred_executed_mb={} reclaimed_bytes={} "
             "reclaim_target={} skipped={} "
             "budget_limited={} oversize_skipped={} "
             "staging_limited={} protected_skipped={} "
@@ -1719,13 +1741,16 @@ void BufferCache::RunGarbageCollector() {
             max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
             readback_successes, readback_skipped, retired_buffers, deleted_buffers, delete_skipped,
             retired_delete_deferred, fence_delete_deferred, critical_delete_deferred,
-            large_delete_deferred, reclaimed_bytes, reclaim_target_bytes, skipped_buffers,
-            budget_limited, oversize_skipped, staging_limited, protected_skipped, recent_skipped,
-            invalid_skipped, queue_selected, queue_protected_skipped, readback_bytes_scheduled,
-            effective_readback_budget_bytes, readback_budget_bytes, base_readback_budget_bytes,
-            retired_delete_limit, remaining_retired_deletes,
-            critical_delete_overshoot_bytes / (1024ULL * 1024ULL), retire_small_ticks,
-            retire_medium_ticks, retire_large_ticks,
+            large_delete_deferred, deferred_destroy_enqueued, deferred_destroy_executed,
+            deferred_destroy_canceled, deferred_destroy_reactivated,
+            deferred_destroy_enqueued_bytes / (1024ULL * 1024ULL),
+            deferred_destroy_executed_bytes / (1024ULL * 1024ULL), reclaimed_bytes,
+            reclaim_target_bytes, skipped_buffers, budget_limited, oversize_skipped,
+            staging_limited, protected_skipped, recent_skipped, invalid_skipped, queue_selected,
+            queue_protected_skipped, readback_bytes_scheduled, effective_readback_budget_bytes,
+            readback_budget_bytes, base_readback_budget_bytes, retired_delete_limit,
+            remaining_retired_deletes, critical_delete_overshoot_bytes / (1024ULL * 1024ULL),
+            retire_small_ticks, retire_medium_ticks, retire_large_ticks,
             retire_medium_threshold_bytes / (1024ULL * 1024ULL),
             retire_large_threshold_bytes / (1024ULL * 1024ULL), ticks_to_destroy, gc_interval_ticks,
             base_gc_interval_ticks, gc_select_interval_ticks, base_gc_select_interval_ticks,
@@ -1757,6 +1782,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
     auto& meta = gc_buffer_meta[buffer.LRUId()];
     meta.last_use_submit_tick = scheduler.CurrentTick();
     if (meta.retired || meta.pending_destroy) {
+        g_gc_deferred_destroy_reactivated.fetch_add(1, std::memory_order_relaxed);
         meta.retired = false;
         meta.pending_destroy = false;
         meta.retire_ready_tick = 0;
@@ -1801,27 +1827,45 @@ void BufferCache::DeleteBufferGcDeferred(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     const u64 expected_destroy_submit_tick = scheduler.CurrentTick();
     const u64 lru_id = buffer.LRUId();
+    const u64 size_bytes = buffer.SizeBytes();
+    const bool trace_gc_logging = IsBufferGcTraceLoggingEnabled();
 
-    scheduler.DeferOperation([this, buffer_id, lru_id, expected_destroy_submit_tick] {
-        if (IsBufferInvalid(buffer_id)) {
-            return;
-        }
+    g_gc_deferred_destroy_enqueued.fetch_add(1, std::memory_order_relaxed);
+    g_gc_deferred_destroy_enqueued_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
 
-        auto meta_it = gc_buffer_meta.find(lru_id);
-        if (meta_it == gc_buffer_meta.end()) {
-            return;
-        }
+    scheduler.DeferOperation(
+        [this, buffer_id, lru_id, expected_destroy_submit_tick, size_bytes, trace_gc_logging] {
+            if (IsBufferInvalid(buffer_id)) {
+                g_gc_deferred_destroy_canceled.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
-        auto& meta = meta_it->second;
-        if (!meta.pending_destroy || meta.destroy_submit_tick != expected_destroy_submit_tick) {
-            return;
-        }
+            auto meta_it = gc_buffer_meta.find(lru_id);
+            if (meta_it == gc_buffer_meta.end()) {
+                g_gc_deferred_destroy_canceled.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
-        Buffer& buffer = slot_buffers[buffer_id];
-        buffer.is_deleted = true;
-        Unregister(buffer_id);
-        slot_buffers.erase(buffer_id);
-    });
+            auto& meta = meta_it->second;
+            if (!meta.pending_destroy || meta.destroy_submit_tick != expected_destroy_submit_tick) {
+                g_gc_deferred_destroy_canceled.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            Buffer& buffer = slot_buffers[buffer_id];
+            if (trace_gc_logging) {
+                LOG_INFO(Render_Vulkan,
+                         "Buffer GC deferred destroy execute: id={} addr={:#x} size={} bytes "
+                         "lru_id={} destroy_submit_tick={}",
+                         buffer_id.index, buffer.CpuAddr(), size_bytes, lru_id,
+                         expected_destroy_submit_tick);
+            }
+            g_gc_deferred_destroy_executed.fetch_add(1, std::memory_order_relaxed);
+            g_gc_deferred_destroy_executed_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+            buffer.is_deleted = true;
+            Unregister(buffer_id);
+            slot_buffers.erase(buffer_id);
+        });
 }
 
 } // namespace VideoCore
