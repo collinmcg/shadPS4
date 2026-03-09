@@ -177,12 +177,49 @@ namespace {
     return std::clamp<u64>(target, 8, queue_limit);
 }
 
-[[nodiscard]] u64 GetBufferGcRetireTicks(bool aggressive) {
-    const u64 ticks =
-        ParseBufferGcEnvU64(aggressive ? "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_AGGRESSIVE"
-                                       : "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS",
-                            aggressive ? 128 : 128);
+[[nodiscard]] bool HasBufferGcEnvValue(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0';
+}
+
+[[nodiscard]] u64 GetBufferGcRetireThresholdBytes(const char* name, u64 fallback_mb) {
+    constexpr u64 one_mb = 1024ULL * 1024ULL;
+    const u64 threshold_mb = ParseBufferGcEnvU64(name, fallback_mb);
+    return std::clamp<u64>(threshold_mb, 1, 1024) * one_mb;
+}
+
+[[nodiscard]] u64 GetBufferGcRetireClassTicks(const char* normal_name, const char* aggressive_name,
+                                              bool aggressive, u64 fallback) {
+    const u64 ticks = ParseBufferGcEnvU64(aggressive ? aggressive_name : normal_name, fallback);
     return std::clamp<u64>(ticks, 16, 4096);
+}
+
+[[nodiscard]] u64 GetBufferGcRetireTicks(u64 size_bytes, bool aggressive) {
+    const char* global_name = aggressive ? "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_AGGRESSIVE"
+                                         : "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS";
+    if (HasBufferGcEnvValue(global_name)) {
+        const u64 ticks = ParseBufferGcEnvU64(global_name, 128);
+        return std::clamp<u64>(ticks, 16, 4096);
+    }
+
+    const u64 medium_threshold_bytes =
+        GetBufferGcRetireThresholdBytes("SHADPS4_VK_BUFFER_GC_RETIRE_MEDIUM_MB", 1);
+    const u64 large_threshold_bytes =
+        GetBufferGcRetireThresholdBytes("SHADPS4_VK_BUFFER_GC_RETIRE_LARGE_MB", 8);
+
+    if (size_bytes >= large_threshold_bytes) {
+        return GetBufferGcRetireClassTicks("SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_LARGE",
+                                           "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_LARGE_AGGRESSIVE",
+                                           aggressive, 1024);
+    }
+    if (size_bytes >= medium_threshold_bytes) {
+        return GetBufferGcRetireClassTicks("SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_MEDIUM",
+                                           "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_MEDIUM_AGGRESSIVE",
+                                           aggressive, 512);
+    }
+    return GetBufferGcRetireClassTicks("SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_SMALL",
+                                       "SHADPS4_VK_BUFFER_GC_RETIRE_TICKS_SMALL_AGGRESSIVE",
+                                       aggressive, 256);
 }
 
 } // namespace
@@ -1434,7 +1471,15 @@ void BufferCache::RunGarbageCollector() {
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
 
-    const u64 retire_ticks = GetBufferGcRetireTicks(aggressive);
+    const u64 retire_medium_threshold_bytes =
+        GetBufferGcRetireThresholdBytes("SHADPS4_VK_BUFFER_GC_RETIRE_MEDIUM_MB", 1);
+    const u64 retire_large_threshold_bytes =
+        GetBufferGcRetireThresholdBytes("SHADPS4_VK_BUFFER_GC_RETIRE_LARGE_MB", 8);
+    const u64 retire_small_ticks =
+        GetBufferGcRetireTicks(retire_medium_threshold_bytes - 1, aggressive);
+    const u64 retire_medium_ticks =
+        GetBufferGcRetireTicks(retire_medium_threshold_bytes, aggressive);
+    const u64 retire_large_ticks = GetBufferGcRetireTicks(retire_large_threshold_bytes, aggressive);
 
     const auto process_candidate = [&](BufferId buffer_id) {
         if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -1444,6 +1489,7 @@ void BufferCache::RunGarbageCollector() {
 
         Buffer& buffer = slot_buffers[buffer_id];
         const u64 candidate_size_bytes = buffer.SizeBytes();
+        const u64 candidate_retire_ticks = GetBufferGcRetireTicks(candidate_size_bytes, aggressive);
         auto& meta = gc_buffer_meta[buffer.LRUId()];
         meta.queued = false;
         const bool retired_candidate = meta.retired && meta.retire_ready_tick <= gc_tick;
@@ -1480,11 +1526,11 @@ void BufferCache::RunGarbageCollector() {
         if (verbose_gc_logging) {
             LOG_INFO(Render_Vulkan,
                      "Buffer GC candidate: id={} addr={:#x} size={} bytes lru_id={} tick={} "
-                     "state={} retired={} dry_run={} readback_only={} delete_only={} "
-                     "sync_readback={}",
+                     "state={} retired={} retire_ticks={} dry_run={} readback_only={} "
+                     "delete_only={} sync_readback={}",
                      buffer_id.index, buffer.CpuAddr(), buffer.SizeBytes(), buffer.LRUId(), gc_tick,
-                     static_cast<int>(gc_pressure_state), retired_candidate, gc_dry_run,
-                     gc_readback_only, gc_delete_only, gc_sync_readback);
+                     static_cast<int>(gc_pressure_state), retired_candidate, candidate_retire_ticks,
+                     gc_dry_run, gc_readback_only, gc_delete_only, gc_sync_readback);
         }
 
         --remaining_deletions;
@@ -1520,7 +1566,7 @@ void BufferCache::RunGarbageCollector() {
 
         if (!retired_candidate && !gc_delete_only) {
             meta.retired = true;
-            meta.retire_ready_tick = gc_tick + retire_ticks;
+            meta.retire_ready_tick = gc_tick + candidate_retire_ticks;
             meta.touch_heat = 0;
             ++retired_buffers;
             return;
@@ -1580,8 +1626,10 @@ void BufferCache::RunGarbageCollector() {
                  "budget_limited={} oversize_skipped={} staging_limited={} protected_skipped={} "
                  "recent_skipped={} invalid_skipped={} queue_selected={} "
                  "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
-                 "readback_budget={} base_readback_budget={} retire_ticks={} ticks_to_destroy={} "
-                 "interval_ticks={} base_interval_ticks={} select_interval_ticks={} "
+                 "readback_budget={} base_readback_budget={} retire_small_ticks={} "
+                 "retire_medium_ticks={} retire_large_ticks={} retire_medium_mb={} "
+                 "retire_large_mb={} ticks_to_destroy={} interval_ticks={} "
+                 "base_interval_ticks={} select_interval_ticks={} "
                  "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
                  "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
                  gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
@@ -1592,10 +1640,13 @@ void BufferCache::RunGarbageCollector() {
                  budget_limited, oversize_skipped, staging_limited, protected_skipped,
                  recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
                  readback_bytes_scheduled, effective_readback_budget_bytes, readback_budget_bytes,
-                 base_readback_budget_bytes, retire_ticks, ticks_to_destroy, gc_interval_ticks,
-                 base_gc_interval_ticks, gc_select_interval_ticks, base_gc_select_interval_ticks,
-                 queue_target, gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run,
-                 gc_readback_only, gc_delete_only, gc_sync_readback, gc_disabled);
+                 base_readback_budget_bytes, retire_small_ticks, retire_medium_ticks,
+                 retire_large_ticks, retire_medium_threshold_bytes / (1024ULL * 1024ULL),
+                 retire_large_threshold_bytes / (1024ULL * 1024ULL), ticks_to_destroy,
+                 gc_interval_ticks, base_gc_interval_ticks, gc_select_interval_ticks,
+                 base_gc_select_interval_ticks, queue_target, gc_fast_queue.size(),
+                 gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
+                 gc_sync_readback, gc_disabled);
     }
 
     metrics_fast_queue = gc_fast_queue.size();
