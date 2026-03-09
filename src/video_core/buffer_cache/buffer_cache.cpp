@@ -230,6 +230,13 @@ namespace {
     return static_cast<int>(std::clamp<u64>(limit, 1, 64));
 }
 
+[[nodiscard]] u64 GetBufferGcCriticalDeleteOvershootBytes() {
+    constexpr u64 one_mb = 1024ULL * 1024ULL;
+    const u64 overshoot_mb =
+        ParseBufferGcEnvU64("SHADPS4_VK_BUFFER_GC_CRITICAL_DELETE_OVERSHOOT_MB", 512);
+    return std::clamp<u64>(overshoot_mb, 64, 4096) * one_mb;
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1477,6 +1484,7 @@ void BufferCache::RunGarbageCollector() {
     int staging_limited = 0;
     int retired_buffers = 0;
     int retired_delete_deferred = 0;
+    int critical_delete_deferred = 0;
     int large_delete_deferred = 0;
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
@@ -1492,6 +1500,7 @@ void BufferCache::RunGarbageCollector() {
     const u64 retire_large_ticks = GetBufferGcRetireTicks(retire_large_threshold_bytes, aggressive);
     const int retired_delete_limit = GetBufferGcMaxRetiredDeletes(aggressive);
     int remaining_retired_deletes = retired_delete_limit;
+    const u64 critical_delete_overshoot_bytes = GetBufferGcCriticalDeleteOvershootBytes();
 
     const auto process_candidate = [&](BufferId buffer_id) {
         if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -1591,6 +1600,15 @@ void BufferCache::RunGarbageCollector() {
             return;
         }
 
+        const bool in_critical_delete_phase = gc_pressure_state == GcPressureState::Critical;
+        if (retired_candidate && in_critical_delete_phase &&
+            over_critical_bytes < critical_delete_overshoot_bytes) {
+            ++delete_skipped;
+            ++critical_delete_deferred;
+            ++remaining_deletions;
+            return;
+        }
+
         const bool large_candidate = candidate_size_bytes >= retire_large_threshold_bytes;
         const bool allow_large_retired_delete =
             !large_candidate || over_critical_bytes >= candidate_size_bytes;
@@ -1651,38 +1669,42 @@ void BufferCache::RunGarbageCollector() {
         budget_limited > 0 || oversize_skipped > 0 || queue_selected > 0 ||
         queue_protected_skipped > 0 || deleted_buffers > 0 || gc_dry_run || gc_readback_only ||
         gc_delete_only || gc_sync_readback) {
-        LOG_INFO(
-            Render_Vulkan,
-            "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
-            "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
-            "selected={} readback_ok={} readback_skipped={} retired={} deleted={} "
-            "delete_skipped={} retired_delete_deferred={} large_delete_deferred={} "
-            "reclaimed_bytes={} reclaim_target={} skipped={} budget_limited={} oversize_skipped={} "
-            "staging_limited={} protected_skipped={} "
-            "recent_skipped={} invalid_skipped={} queue_selected={} "
-            "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
-            "readback_budget={} base_readback_budget={} retired_delete_limit={} "
-            "remaining_retired_deletes={} retire_small_ticks={} retire_medium_ticks={} "
-            "retire_large_ticks={} retire_medium_mb={} "
-            "retire_large_mb={} ticks_to_destroy={} interval_ticks={} "
-            "base_interval_ticks={} select_interval_ticks={} "
-            "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
-            "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
-            gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
-            trigger_gc_memory, critical_gc_memory, over_trigger_bytes, over_critical_bytes,
-            max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
-            readback_successes, readback_skipped, retired_buffers, deleted_buffers, delete_skipped,
-            retired_delete_deferred, large_delete_deferred, reclaimed_bytes, reclaim_target_bytes,
-            skipped_buffers, budget_limited, oversize_skipped, staging_limited, protected_skipped,
-            recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
-            readback_bytes_scheduled, effective_readback_budget_bytes, readback_budget_bytes,
-            base_readback_budget_bytes, retired_delete_limit, remaining_retired_deletes,
-            retire_small_ticks, retire_medium_ticks, retire_large_ticks,
-            retire_medium_threshold_bytes / (1024ULL * 1024ULL),
-            retire_large_threshold_bytes / (1024ULL * 1024ULL), ticks_to_destroy, gc_interval_ticks,
-            base_gc_interval_ticks, gc_select_interval_ticks, base_gc_select_interval_ticks,
-            queue_target, gc_fast_queue.size(), gc_slow_queue.size(), gc_dry_run, gc_readback_only,
-            gc_delete_only, gc_sync_readback, gc_disabled);
+        LOG_INFO(Render_Vulkan,
+                 "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
+                 "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
+                 "selected={} readback_ok={} readback_skipped={} retired={} deleted={} "
+                 "delete_skipped={} retired_delete_deferred={} critical_delete_deferred={} "
+                 "large_delete_deferred={} reclaimed_bytes={} reclaim_target={} skipped={} "
+                 "budget_limited={} oversize_skipped={} "
+                 "staging_limited={} protected_skipped={} "
+                 "recent_skipped={} invalid_skipped={} queue_selected={} "
+                 "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
+                 "readback_budget={} base_readback_budget={} retired_delete_limit={} "
+                 "remaining_retired_deletes={} critical_delete_overshoot_mb={} "
+                 "retire_small_ticks={} retire_medium_ticks={} retire_large_ticks={} "
+                 "retire_medium_mb={} "
+                 "retire_large_mb={} ticks_to_destroy={} interval_ticks={} "
+                 "base_interval_ticks={} select_interval_ticks={} "
+                 "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
+                 "dry_run={} readback_only={} delete_only={} sync_readback={} disabled={}",
+                 gc_tick, static_cast<int>(gc_pressure_state), aggressive, total_used_memory,
+                 trigger_gc_memory, critical_gc_memory, over_trigger_bytes, over_critical_bytes,
+                 max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
+                 readback_successes, readback_skipped, retired_buffers, deleted_buffers,
+                 delete_skipped, retired_delete_deferred, critical_delete_deferred,
+                 large_delete_deferred, reclaimed_bytes, reclaim_target_bytes, skipped_buffers,
+                 budget_limited, oversize_skipped, staging_limited, protected_skipped,
+                 recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
+                 readback_bytes_scheduled, effective_readback_budget_bytes, readback_budget_bytes,
+                 base_readback_budget_bytes, retired_delete_limit, remaining_retired_deletes,
+                 critical_delete_overshoot_bytes / (1024ULL * 1024ULL), retire_small_ticks,
+                 retire_medium_ticks, retire_large_ticks,
+                 retire_medium_threshold_bytes / (1024ULL * 1024ULL),
+                 retire_large_threshold_bytes / (1024ULL * 1024ULL), ticks_to_destroy,
+                 gc_interval_ticks, base_gc_interval_ticks, gc_select_interval_ticks,
+                 base_gc_select_interval_ticks, queue_target, gc_fast_queue.size(),
+                 gc_slow_queue.size(), gc_dry_run, gc_readback_only, gc_delete_only,
+                 gc_sync_readback, gc_disabled);
     }
 
     metrics_fast_queue = gc_fast_queue.size();
