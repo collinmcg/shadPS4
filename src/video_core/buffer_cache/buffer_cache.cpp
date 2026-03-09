@@ -222,6 +222,14 @@ namespace {
                                        aggressive, 256);
 }
 
+[[nodiscard]] int GetBufferGcMaxRetiredDeletes(bool aggressive) {
+    const u64 limit =
+        ParseBufferGcEnvU64(aggressive ? "SHADPS4_VK_BUFFER_GC_MAX_RETIRED_DELETIONS_AGGRESSIVE"
+                                       : "SHADPS4_VK_BUFFER_GC_MAX_RETIRED_DELETIONS",
+                            aggressive ? 8 : 4);
+    return static_cast<int>(std::clamp<u64>(limit, 1, 64));
+}
+
 } // namespace
 
 static constexpr size_t DataShareBufferSize = 64_KB;
@@ -1468,6 +1476,7 @@ void BufferCache::RunGarbageCollector() {
     int invalid_skipped = 0;
     int staging_limited = 0;
     int retired_buffers = 0;
+    int retired_delete_deferred = 0;
     int large_delete_deferred = 0;
     u64 readback_bytes_scheduled = 0;
     u64 reclaimed_bytes = 0;
@@ -1481,6 +1490,8 @@ void BufferCache::RunGarbageCollector() {
     const u64 retire_medium_ticks =
         GetBufferGcRetireTicks(retire_medium_threshold_bytes, aggressive);
     const u64 retire_large_ticks = GetBufferGcRetireTicks(retire_large_threshold_bytes, aggressive);
+    const int retired_delete_limit = GetBufferGcMaxRetiredDeletes(aggressive);
+    int remaining_retired_deletes = retired_delete_limit;
 
     const auto process_candidate = [&](BufferId buffer_id) {
         if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -1573,6 +1584,13 @@ void BufferCache::RunGarbageCollector() {
             return;
         }
 
+        if (retired_candidate && remaining_retired_deletes <= 0) {
+            ++delete_skipped;
+            ++retired_delete_deferred;
+            ++remaining_deletions;
+            return;
+        }
+
         const bool large_candidate = candidate_size_bytes >= retire_large_threshold_bytes;
         const bool allow_large_retired_delete =
             !large_candidate || over_critical_bytes >= candidate_size_bytes;
@@ -1581,6 +1599,10 @@ void BufferCache::RunGarbageCollector() {
             ++large_delete_deferred;
             ++remaining_deletions;
             return;
+        }
+
+        if (retired_candidate) {
+            --remaining_retired_deletes;
         }
 
         meta.retired = false;
@@ -1634,13 +1656,14 @@ void BufferCache::RunGarbageCollector() {
             "Buffer GC pass: tick={} state={} aggressive={} used={} trigger={} critical={} "
             "over_trigger={} over_critical={} max_deletions={} base_max_deletions={} "
             "selected={} readback_ok={} readback_skipped={} retired={} deleted={} "
-            "delete_skipped={} large_delete_deferred={} reclaimed_bytes={} "
-            "reclaim_target={} skipped={} budget_limited={} oversize_skipped={} "
+            "delete_skipped={} retired_delete_deferred={} large_delete_deferred={} "
+            "reclaimed_bytes={} reclaim_target={} skipped={} budget_limited={} oversize_skipped={} "
             "staging_limited={} protected_skipped={} "
             "recent_skipped={} invalid_skipped={} queue_selected={} "
             "queue_protected_skipped={} readback_bytes={} effective_readback_budget={} "
-            "readback_budget={} base_readback_budget={} retire_small_ticks={} "
-            "retire_medium_ticks={} retire_large_ticks={} retire_medium_mb={} "
+            "readback_budget={} base_readback_budget={} retired_delete_limit={} "
+            "remaining_retired_deletes={} retire_small_ticks={} retire_medium_ticks={} "
+            "retire_large_ticks={} retire_medium_mb={} "
             "retire_large_mb={} ticks_to_destroy={} interval_ticks={} "
             "base_interval_ticks={} select_interval_ticks={} "
             "base_select_interval_ticks={} queue_target={} fast_queue={} slow_queue={} "
@@ -1649,10 +1672,11 @@ void BufferCache::RunGarbageCollector() {
             trigger_gc_memory, critical_gc_memory, over_trigger_bytes, over_critical_bytes,
             max_deletions_allowed, base_max_deletions_allowed, selected_candidates,
             readback_successes, readback_skipped, retired_buffers, deleted_buffers, delete_skipped,
-            large_delete_deferred, reclaimed_bytes, reclaim_target_bytes, skipped_buffers,
-            budget_limited, oversize_skipped, staging_limited, protected_skipped, recent_skipped,
-            invalid_skipped, queue_selected, queue_protected_skipped, readback_bytes_scheduled,
-            effective_readback_budget_bytes, readback_budget_bytes, base_readback_budget_bytes,
+            retired_delete_deferred, large_delete_deferred, reclaimed_bytes, reclaim_target_bytes,
+            skipped_buffers, budget_limited, oversize_skipped, staging_limited, protected_skipped,
+            recent_skipped, invalid_skipped, queue_selected, queue_protected_skipped,
+            readback_bytes_scheduled, effective_readback_budget_bytes, readback_budget_bytes,
+            base_readback_budget_bytes, retired_delete_limit, remaining_retired_deletes,
             retire_small_ticks, retire_medium_ticks, retire_large_ticks,
             retire_medium_threshold_bytes / (1024ULL * 1024ULL),
             retire_large_threshold_bytes / (1024ULL * 1024ULL), ticks_to_destroy, gc_interval_ticks,
