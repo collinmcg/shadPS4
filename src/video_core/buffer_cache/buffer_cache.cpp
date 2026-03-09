@@ -1347,6 +1347,8 @@ void BufferCache::RunGarbageCollector() {
     }
 
     const bool aggressive = gc_pressure_state == GcPressureState::Critical;
+    const bool allow_critical_destroy = AllowBufferGcCriticalDestroy();
+    const bool retire_only_critical_mode = aggressive && !allow_critical_destroy;
     const u64 over_trigger_bytes =
         total_used_memory > trigger_gc_memory ? (total_used_memory - trigger_gc_memory) : 0;
     const u64 over_critical_bytes =
@@ -1354,16 +1356,23 @@ void BufferCache::RunGarbageCollector() {
 
     const u64 base_gc_interval_ticks = GetBufferGcIntervalTicks();
     u64 gc_interval_ticks = base_gc_interval_ticks;
-    if (aggressive && over_critical_bytes > 0) {
+    if (aggressive && over_critical_bytes > 0 && !retire_only_critical_mode) {
         constexpr u64 interval_step_bytes = 256ULL * 1024ULL * 1024ULL;
         const u64 divisor = 1ULL + std::min<u64>(over_critical_bytes / interval_step_bytes, 7ULL);
         gc_interval_ticks = std::max<u64>(1, base_gc_interval_ticks / divisor);
     }
+    if (retire_only_critical_mode) {
+        gc_interval_ticks = std::max<u64>(base_gc_interval_ticks, gc_interval_ticks);
+    }
 
     const u64 base_gc_select_interval_ticks = GetBufferGcSelectIntervalTicks();
     u64 gc_select_interval_ticks = base_gc_select_interval_ticks;
-    if (aggressive) {
+    if (aggressive && !retire_only_critical_mode) {
         gc_select_interval_ticks = std::max<u64>(1, base_gc_select_interval_ticks / 2ULL);
+    }
+    if (retire_only_critical_mode) {
+        gc_select_interval_ticks =
+            std::max<u64>(base_gc_select_interval_ticks, gc_select_interval_ticks);
     }
 
     const u64 min_age_ticks = std::min<u64>(GetBufferGcAgeThreshold(aggressive), gc_tick);
@@ -1383,6 +1392,9 @@ void BufferCache::RunGarbageCollector() {
     int queue_retire_waiting = 0;
     if (should_select && total_queue_size() < queue_target) {
         int selection_quota = GetBufferGcSelectionQuota(aggressive);
+        if (retire_only_critical_mode) {
+            selection_quota = std::min(selection_quota, 16);
+        }
         const u64 tick_threshold = gc_tick - min_age_ticks;
         lru_cache.ForEachItemBelow(tick_threshold, [&](BufferId buffer_id) {
             if (selection_quota <= 0 || total_queue_size() >= queue_target) {
@@ -1403,6 +1415,10 @@ void BufferCache::RunGarbageCollector() {
             }
             if (meta.retired) {
                 if (meta.retire_ready_tick > gc_tick) {
+                    ++queue_retire_waiting;
+                    return false;
+                }
+                if (retire_only_critical_mode) {
                     ++queue_retire_waiting;
                     return false;
                 }
