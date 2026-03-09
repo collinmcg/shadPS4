@@ -238,6 +238,11 @@ inline std::atomic<u64> g_gc_deferred_destroy_reactivated{};
     return static_cast<int>(std::clamp<u64>(limit, 1, 64));
 }
 
+[[nodiscard]] bool AllowBufferGcCriticalDestroy() {
+    const char* value = std::getenv("SHADPS4_VK_BUFFER_GC_ALLOW_CRITICAL_DESTROY");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
 [[nodiscard]] u64 GetBufferGcCriticalDeleteOvershootBytes() {
     constexpr u64 one_mb = 1024ULL * 1024ULL;
     const u64 overshoot_mb =
@@ -1643,6 +1648,12 @@ void BufferCache::RunGarbageCollector() {
         }
 
         const bool in_critical_delete_phase = gc_pressure_state == GcPressureState::Critical;
+        if (retired_candidate && in_critical_delete_phase && !AllowBufferGcCriticalDestroy()) {
+            ++delete_skipped;
+            ++critical_delete_deferred;
+            ++remaining_deletions;
+            return;
+        }
         if (retired_candidate && in_critical_delete_phase &&
             over_critical_bytes < critical_delete_overshoot_bytes) {
             ++delete_skipped;

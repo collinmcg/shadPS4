@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include "common/types.h"
 
 namespace Common::RenderPressureMetrics {
@@ -46,6 +47,14 @@ inline std::atomic<u64> g_last_image_layer_coercion_ms{};
 inline std::atomic<u64> g_image_layer_window_start_ms{};
 inline std::atomic<u64> g_image_layer_window_count{};
 
+[[nodiscard]] inline bool IsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VK_RENDER_PRESSURE_METRICS");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 [[nodiscard]] inline u64 NowMs() {
     using namespace std::chrono;
     return static_cast<u64>(
@@ -73,6 +82,9 @@ inline void PublishRolling(std::atomic<u64>& window_start_ms, std::atomic<u64>& 
 }
 
 inline void PublishShaderCompile(const u64 duration_us) {
+    if (!IsEnabled()) {
+        return;
+    }
     const u64 now_ms = NowMs();
     g_shader_compiles_total.fetch_add(1, std::memory_order_relaxed);
     g_last_shader_compile_ms.store(now_ms, std::memory_order_relaxed);
@@ -82,6 +94,9 @@ inline void PublishShaderCompile(const u64 duration_us) {
 }
 
 inline void PublishPipelineCompile(const u64 duration_us) {
+    if (!IsEnabled()) {
+        return;
+    }
     const u64 now_ms = NowMs();
     g_pipeline_compiles_total.fetch_add(1, std::memory_order_relaxed);
     g_last_pipeline_compile_ms.store(now_ms, std::memory_order_relaxed);
@@ -91,6 +106,9 @@ inline void PublishPipelineCompile(const u64 duration_us) {
 }
 
 inline void PublishImageLayerCoercion() {
+    if (!IsEnabled()) {
+        return;
+    }
     const u64 now_ms = NowMs();
     g_image_layer_coercions_total.fetch_add(1, std::memory_order_relaxed);
     g_last_image_layer_coercion_ms.store(now_ms, std::memory_order_relaxed);
@@ -100,6 +118,9 @@ inline void PublishImageLayerCoercion() {
 
 inline Snapshot GetSnapshot() {
     Snapshot snap;
+    if (!IsEnabled()) {
+        return snap;
+    }
     snap.shader_compiles_total = g_shader_compiles_total.load(std::memory_order_relaxed);
     snap.shader_compiles_per_sec = g_shader_compiles_per_sec.load(std::memory_order_relaxed);
     snap.last_shader_compile_ms = g_last_shader_compile_ms.load(std::memory_order_relaxed);
