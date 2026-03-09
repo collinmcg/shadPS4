@@ -8,9 +8,9 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
+#include <queue>
 
 #include "common/types.h"
 
@@ -25,7 +25,7 @@ public:
 
     void Start();
     void Stop();
-    bool Enqueue(Task task);
+    [[nodiscard]] u32 Enqueue(Task task);
 
     [[nodiscard]] u32 QueueDepth() const;
     [[nodiscard]] u64 CompletedTasks() const;

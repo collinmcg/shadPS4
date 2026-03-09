@@ -387,6 +387,22 @@ bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
     return queue_depth >= high_watermark;
 }
 
+void PipelineCache::UpdateAsyncQueueObservability(u32 queue_depth) {
+    perf_counters.async_queue_depth_peak =
+        std::max<u64>(perf_counters.async_queue_depth_peak, queue_depth);
+    if (!compile_queue) {
+        return;
+    }
+
+    const u64 total_misses =
+        perf_counters.graphics_cache_misses + perf_counters.compute_cache_misses;
+    // Queue completion count is telemetry-only; sample periodically when idle to reduce
+    // miss-path atomic churn, but sample every miss while work is actively queued.
+    if (queue_depth > 0 || (total_misses % 16) == 0) {
+        perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+    }
+}
+
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
     // PR3 staged hook: key-aware deferred execution outcome handling.
@@ -513,6 +529,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
+                auto observed_depth = depth_before;
                 if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
@@ -530,13 +547,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                                 .count()),
                     };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
+                    if (const auto depth_after = compile_queue->Enqueue([this, payload, budget_us] {
+                            HandleDeferredCompilePayload(payload, budget_us);
+                        });
+                        depth_after > 0) {
+                        observed_depth = depth_after;
+                    }
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(observed_depth);
             }
         }
 
@@ -612,6 +630,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             SetComputeBuildState(compute_key, PipelineBuildState::Queued);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
+                auto observed_depth = depth_before;
                 if (ShouldThrottleSyncFallback(depth_before)) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
@@ -629,13 +648,14 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                 .count()),
                     };
                     const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
+                    if (const auto depth_after = compile_queue->Enqueue([this, payload, budget_us] {
+                            HandleDeferredCompilePayload(payload, budget_us);
+                        });
+                        depth_after > 0) {
+                        observed_depth = depth_after;
+                    }
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(observed_depth);
             }
         }
 
