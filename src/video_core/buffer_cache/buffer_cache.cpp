@@ -1384,6 +1384,10 @@ void BufferCache::RunGarbageCollector() {
             if (meta.queued) {
                 return false;
             }
+            if (meta.pending_destroy) {
+                ++queue_retire_waiting;
+                return false;
+            }
             if (meta.retired) {
                 if (meta.retire_ready_tick > gc_tick) {
                     ++queue_retire_waiting;
@@ -1516,6 +1520,11 @@ void BufferCache::RunGarbageCollector() {
         const u64 destroy_submit_tick =
             std::max(meta.last_use_submit_tick, meta.retire_submit_tick);
         meta.queued = false;
+        if (meta.pending_destroy) {
+            ++delete_skipped;
+            return;
+        }
+
         const bool retired_candidate = meta.retired && meta.retire_ready_tick <= gc_tick;
         if (!retired_candidate && meta.protected_until_tick > gc_tick) {
             ++protected_skipped;
@@ -1637,11 +1646,13 @@ void BufferCache::RunGarbageCollector() {
         }
 
         meta.retired = false;
+        meta.pending_destroy = true;
         meta.retire_ready_tick = 0;
         meta.retire_submit_tick = 0;
+        meta.destroy_submit_tick = scheduler.CurrentTick();
         ++deleted_buffers;
         reclaimed_bytes += candidate_size_bytes;
-        DeleteBuffer(buffer_id);
+        DeleteBufferGcDeferred(buffer_id);
     };
 
     const auto queues_not_empty = [&] { return !gc_fast_queue.empty() || !gc_slow_queue.empty(); };
@@ -1731,8 +1742,8 @@ void BufferCache::RunGarbageCollector() {
     metrics_readback_bytes = readback_bytes_scheduled;
 
     for (auto it = gc_buffer_meta.begin(); it != gc_buffer_meta.end();) {
-        if (!it->second.queued && !it->second.retired && it->second.touch_heat == 0 &&
-            it->second.protected_until_tick < gc_tick) {
+        if (!it->second.queued && !it->second.retired && !it->second.pending_destroy &&
+            it->second.touch_heat == 0 && it->second.protected_until_tick < gc_tick) {
             it = gc_buffer_meta.erase(it);
             continue;
         }
@@ -1745,10 +1756,12 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 
     auto& meta = gc_buffer_meta[buffer.LRUId()];
     meta.last_use_submit_tick = scheduler.CurrentTick();
-    if (meta.retired) {
+    if (meta.retired || meta.pending_destroy) {
         meta.retired = false;
+        meta.pending_destroy = false;
         meta.retire_ready_tick = 0;
         meta.retire_submit_tick = 0;
+        meta.destroy_submit_tick = 0;
     }
     if (meta.touch_heat < std::numeric_limits<u8>::max()) {
         ++meta.touch_heat;
@@ -1767,15 +1780,48 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     if (auto it = gc_buffer_meta.find(buffer.LRUId()); it != gc_buffer_meta.end()) {
         it->second.queued = false;
         it->second.retired = false;
+        it->second.pending_destroy = false;
         it->second.touch_heat = 0;
         it->second.protected_until_tick = 0;
         it->second.retire_ready_tick = 0;
         it->second.last_use_submit_tick = 0;
         it->second.retire_submit_tick = 0;
+        it->second.destroy_submit_tick = 0;
     }
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
     buffer.is_deleted = true;
+}
+
+void BufferCache::DeleteBufferGcDeferred(BufferId buffer_id) {
+    if (IsBufferInvalid(buffer_id)) {
+        return;
+    }
+
+    Buffer& buffer = slot_buffers[buffer_id];
+    const u64 expected_destroy_submit_tick = scheduler.CurrentTick();
+    const u64 lru_id = buffer.LRUId();
+
+    scheduler.DeferOperation([this, buffer_id, lru_id, expected_destroy_submit_tick] {
+        if (IsBufferInvalid(buffer_id)) {
+            return;
+        }
+
+        auto meta_it = gc_buffer_meta.find(lru_id);
+        if (meta_it == gc_buffer_meta.end()) {
+            return;
+        }
+
+        auto& meta = meta_it->second;
+        if (!meta.pending_destroy || meta.destroy_submit_tick != expected_destroy_submit_tick) {
+            return;
+        }
+
+        Buffer& buffer = slot_buffers[buffer_id];
+        buffer.is_deleted = true;
+        Unregister(buffer_id);
+        slot_buffers.erase(buffer_id);
+    });
 }
 
 } // namespace VideoCore
