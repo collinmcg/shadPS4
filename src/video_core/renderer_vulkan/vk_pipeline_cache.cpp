@@ -407,6 +407,19 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
                                                  u32 budget_us) {
     // PR3 staged hook: key-aware deferred execution outcome handling.
     // NOTE: actual Vulkan compile remains on sync fallback path for safety in this PR.
+    const auto mark_graphics_failed_if_tracked = [this](const GraphicsPipelineKey& key) {
+        std::scoped_lock lk{build_state_mutex};
+        if (const auto it = graphics_build_states.find(key); it != graphics_build_states.end()) {
+            it.value() = PipelineBuildState::Failed;
+        }
+    };
+    const auto mark_compute_failed_if_tracked = [this](const ComputePipelineKey& key) {
+        std::scoped_lock lk{build_state_mutex};
+        if (const auto it = compute_build_states.find(key); it != compute_build_states.end()) {
+            it.value() = PipelineBuildState::Failed;
+        }
+    };
+
     ++perf_counters.deferred_handler_calls;
     try {
         const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -416,24 +429,16 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
         if (age_us > budget_us) {
             ++perf_counters.deferred_handler_budget_exceeded;
             ++perf_counters.async_queue_budget_warnings;
+            // Only flag tracked keys. The sync fallback path clears build-state tracking once the
+            // real Vulkan compile finishes, so re-introducing a state entry here would leave stale
+            // map entries behind and can regress a resolved key back into Failed/Queued.
             if (payload.is_compute) {
                 if (payload.compute_key) {
-                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+                    mark_compute_failed_if_tracked(*payload.compute_key);
                 }
             } else {
                 if (payload.graphics_key) {
-                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
-                }
-            }
-        } else {
-            // Keep key in queued state until sync fallback build path resolves to Ready.
-            if (payload.is_compute) {
-                if (payload.compute_key) {
-                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Queued);
-                }
-            } else {
-                if (payload.graphics_key) {
-                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Queued);
+                    mark_graphics_failed_if_tracked(*payload.graphics_key);
                 }
             }
         }
@@ -441,11 +446,11 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
         ++perf_counters.deferred_handler_failures;
         if (payload.is_compute) {
             if (payload.compute_key) {
-                SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+                mark_compute_failed_if_tracked(*payload.compute_key);
             }
         } else {
             if (payload.graphics_key) {
-                SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
+                mark_graphics_failed_if_tracked(*payload.graphics_key);
             }
         }
     }
