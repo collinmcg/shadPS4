@@ -431,7 +431,7 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
             ++perf_counters.async_queue_budget_warnings;
             // Only flag tracked keys. The sync fallback path clears build-state tracking once the
             // real Vulkan compile finishes, so re-introducing a state entry here would leave stale
-            // map entries behind and can regress a resolved key back into Failed/Queued.
+            // map entries behind and can regress a resolved key back into Failed/Compiling.
             if (payload.is_compute) {
                 if (payload.compute_key) {
                     mark_compute_failed_if_tracked(*payload.compute_key);
@@ -531,7 +531,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.graphics_async_queue_hits;
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
                 auto observed_depth = depth_before;
@@ -566,7 +566,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         GraphicsPipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
         if (async_pso_requested) {
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
             ++perf_counters.graphics_sync_fallbacks;
         }
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -632,7 +631,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.compute_async_queue_hits;
-            SetComputeBuildState(compute_key, PipelineBuildState::Queued);
+            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
             if (compile_queue) {
                 const auto depth_before = compile_queue->QueueDepth();
                 auto observed_depth = depth_before;
@@ -667,7 +666,6 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         ComputePipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
         if (async_pso_requested) {
-            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
             ++perf_counters.compute_sync_fallbacks;
         }
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,

@@ -71,7 +71,6 @@ class PipelineCache {
 public:
     enum class PipelineBuildState : u8 {
         Missing,
-        Queued,
         Compiling,
         Ready,
         Failed,
