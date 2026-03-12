@@ -381,10 +381,9 @@ PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
     return it == compute_build_states.end() ? PipelineBuildState::Missing : it->second;
 }
 
-bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
+u32 PipelineCache::AsyncQueueThrottleDepth() const {
     // Aggressive profile: allow deeper queue before forcing throttle/fallback behavior.
-    const u32 high_watermark = std::max<u32>(24u, async_pso_workers * 12u);
-    return queue_depth >= high_watermark;
+    return std::max<u32>(24u, async_pso_workers * 12u);
 }
 
 void PipelineCache::UpdateAsyncQueueObservability(u32 queue_depth) {
@@ -533,31 +532,32 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             ++perf_counters.graphics_async_queue_hits;
             SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
             if (compile_queue) {
-                const auto depth_before = compile_queue->QueueDepth();
-                auto observed_depth = depth_before;
-                if (ShouldThrottleSyncFallback(depth_before)) {
+                auto observed_depth = 0u;
+                const auto queue_limit = AsyncQueueThrottleDepth();
+                const DeferredCompilePayload payload{
+                    .key_hash = pipeline_hash,
+                    .is_compute = false,
+                    .graphics_key = graphics_key,
+                    .compute_key = std::nullopt,
+                    .enqueued_ts_us =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                };
+                const auto budget_us = async_pso_soft_budget_us;
+                // Keep the throttle check and enqueue under the same queue lock so bursty misses
+                // cannot all observe the same stale low depth and overshoot the queue target.
+                const auto enqueue_result = compile_queue->TryEnqueue(
+                    [this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
+                    },
+                    queue_limit);
+                observed_depth = enqueue_result.queue_depth;
+                if (!enqueue_result.enqueued && observed_depth >= queue_limit) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.graphics_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = false,
-                        .graphics_key = graphics_key,
-                        .compute_key = std::nullopt,
-                        .enqueued_ts_us = static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    if (const auto depth_after = compile_queue->Enqueue([this, payload, budget_us] {
-                            HandleDeferredCompilePayload(payload, budget_us);
-                        });
-                        depth_after > 0) {
-                        observed_depth = depth_after;
-                    }
                 }
                 UpdateAsyncQueueObservability(observed_depth);
             }
@@ -633,31 +633,30 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             ++perf_counters.compute_async_queue_hits;
             SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
             if (compile_queue) {
-                const auto depth_before = compile_queue->QueueDepth();
-                auto observed_depth = depth_before;
-                if (ShouldThrottleSyncFallback(depth_before)) {
+                auto observed_depth = 0u;
+                const auto queue_limit = AsyncQueueThrottleDepth();
+                const DeferredCompilePayload payload{
+                    .key_hash = pipeline_hash,
+                    .is_compute = true,
+                    .graphics_key = std::nullopt,
+                    .compute_key = compute_key,
+                    .enqueued_ts_us =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                };
+                const auto budget_us = async_pso_soft_budget_us;
+                const auto enqueue_result = compile_queue->TryEnqueue(
+                    [this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
+                    },
+                    queue_limit);
+                observed_depth = enqueue_result.queue_depth;
+                if (!enqueue_result.enqueued && observed_depth >= queue_limit) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.compute_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = true,
-                        .graphics_key = std::nullopt,
-                        .compute_key = compute_key,
-                        .enqueued_ts_us = static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    if (const auto depth_after = compile_queue->Enqueue([this, payload, budget_us] {
-                            HandleDeferredCompilePayload(payload, budget_us);
-                        });
-                        depth_after > 0) {
-                        observed_depth = depth_after;
-                    }
                 }
                 UpdateAsyncQueueObservability(observed_depth);
             }

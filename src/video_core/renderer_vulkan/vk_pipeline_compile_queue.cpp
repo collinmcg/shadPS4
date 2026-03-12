@@ -35,20 +35,28 @@ void PipelineCompileQueue::Stop() {
     queue_depth_.store(0, std::memory_order_relaxed);
 }
 
-u32 PipelineCompileQueue::Enqueue(Task task) {
+PipelineCompileQueue::EnqueueResult PipelineCompileQueue::TryEnqueue(Task task,
+                                                                     u32 max_queue_depth) {
     if (!running_) {
-        return 0;
+        return {};
     }
 
-    u32 queue_depth = 0;
+    EnqueueResult result{};
     {
         std::scoped_lock lk{mutex_};
+        result.queue_depth = static_cast<u32>(tasks_.size());
+        if (result.queue_depth >= max_queue_depth) {
+            queue_depth_.store(result.queue_depth, std::memory_order_relaxed);
+            return result;
+        }
+
         tasks_.push(std::move(task));
-        queue_depth = static_cast<u32>(tasks_.size());
-        queue_depth_.store(queue_depth, std::memory_order_relaxed);
+        result.queue_depth = static_cast<u32>(tasks_.size());
+        result.enqueued = true;
+        queue_depth_.store(result.queue_depth, std::memory_order_relaxed);
     }
     cv_.notify_one();
-    return queue_depth;
+    return result;
 }
 
 u32 PipelineCompileQueue::QueueDepth() const {
