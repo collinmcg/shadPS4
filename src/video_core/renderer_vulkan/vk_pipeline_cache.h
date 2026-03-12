@@ -71,7 +71,6 @@ class PipelineCache {
 public:
     enum class PipelineBuildState : u8 {
         Missing,
-        Queued,
         Compiling,
         Ready,
         Failed,
@@ -160,7 +159,8 @@ private:
     void ClearComputeBuildState(const ComputePipelineKey& key);
     [[nodiscard]] PipelineBuildState GetGraphicsBuildState(const GraphicsPipelineKey& key) const;
     [[nodiscard]] PipelineBuildState GetComputeBuildState(const ComputePipelineKey& key) const;
-    [[nodiscard]] bool ShouldThrottleSyncFallback(u32 queue_depth) const;
+    [[nodiscard]] u32 AsyncQueueThrottleDepth() const;
+    void UpdateAsyncQueueObservability(u32 queue_depth);
     void HandleDeferredCompilePayload(const DeferredCompilePayload& payload, u32 budget_us);
     void LoadPrewarmManifest();
     void SchedulePrewarmEntries();

@@ -8,9 +8,9 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
+#include <queue>
 
 #include "common/types.h"
 
@@ -20,12 +20,17 @@ class PipelineCompileQueue {
 public:
     using Task = std::function<void()>;
 
+    struct EnqueueResult {
+        u32 queue_depth{};
+        bool enqueued{};
+    };
+
     explicit PipelineCompileQueue(u32 worker_count = 1);
     ~PipelineCompileQueue();
 
     void Start();
     void Stop();
-    bool Enqueue(Task task);
+    [[nodiscard]] EnqueueResult TryEnqueue(Task task, u32 max_queue_depth);
 
     [[nodiscard]] u32 QueueDepth() const;
     [[nodiscard]] u64 CompletedTasks() const;

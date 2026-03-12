@@ -381,16 +381,44 @@ PipelineCache::PipelineBuildState PipelineCache::GetComputeBuildState(
     return it == compute_build_states.end() ? PipelineBuildState::Missing : it->second;
 }
 
-bool PipelineCache::ShouldThrottleSyncFallback(u32 queue_depth) const {
+u32 PipelineCache::AsyncQueueThrottleDepth() const {
     // Aggressive profile: allow deeper queue before forcing throttle/fallback behavior.
-    const u32 high_watermark = std::max<u32>(24u, async_pso_workers * 12u);
-    return queue_depth >= high_watermark;
+    return std::max<u32>(24u, async_pso_workers * 12u);
+}
+
+void PipelineCache::UpdateAsyncQueueObservability(u32 queue_depth) {
+    perf_counters.async_queue_depth_peak =
+        std::max<u64>(perf_counters.async_queue_depth_peak, queue_depth);
+    if (!compile_queue) {
+        return;
+    }
+
+    const u64 total_misses =
+        perf_counters.graphics_cache_misses + perf_counters.compute_cache_misses;
+    // Queue completion count is telemetry-only; sample periodically when idle to reduce
+    // miss-path atomic churn, but sample every miss while work is actively queued.
+    if (queue_depth > 0 || (total_misses % 16) == 0) {
+        perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+    }
 }
 
 void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& payload,
                                                  u32 budget_us) {
     // PR3 staged hook: key-aware deferred execution outcome handling.
     // NOTE: actual Vulkan compile remains on sync fallback path for safety in this PR.
+    const auto mark_graphics_failed_if_tracked = [this](const GraphicsPipelineKey& key) {
+        std::scoped_lock lk{build_state_mutex};
+        if (const auto it = graphics_build_states.find(key); it != graphics_build_states.end()) {
+            it.value() = PipelineBuildState::Failed;
+        }
+    };
+    const auto mark_compute_failed_if_tracked = [this](const ComputePipelineKey& key) {
+        std::scoped_lock lk{build_state_mutex};
+        if (const auto it = compute_build_states.find(key); it != compute_build_states.end()) {
+            it.value() = PipelineBuildState::Failed;
+        }
+    };
+
     ++perf_counters.deferred_handler_calls;
     try {
         const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -400,24 +428,16 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
         if (age_us > budget_us) {
             ++perf_counters.deferred_handler_budget_exceeded;
             ++perf_counters.async_queue_budget_warnings;
+            // Only flag tracked keys. The sync fallback path clears build-state tracking once the
+            // real Vulkan compile finishes, so re-introducing a state entry here would leave stale
+            // map entries behind and can regress a resolved key back into Failed/Compiling.
             if (payload.is_compute) {
                 if (payload.compute_key) {
-                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+                    mark_compute_failed_if_tracked(*payload.compute_key);
                 }
             } else {
                 if (payload.graphics_key) {
-                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
-                }
-            }
-        } else {
-            // Keep key in queued state until sync fallback build path resolves to Ready.
-            if (payload.is_compute) {
-                if (payload.compute_key) {
-                    SetComputeBuildState(*payload.compute_key, PipelineBuildState::Queued);
-                }
-            } else {
-                if (payload.graphics_key) {
-                    SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Queued);
+                    mark_graphics_failed_if_tracked(*payload.graphics_key);
                 }
             }
         }
@@ -425,11 +445,11 @@ void PipelineCache::HandleDeferredCompilePayload(const DeferredCompilePayload& p
         ++perf_counters.deferred_handler_failures;
         if (payload.is_compute) {
             if (payload.compute_key) {
-                SetComputeBuildState(*payload.compute_key, PipelineBuildState::Failed);
+                mark_compute_failed_if_tracked(*payload.compute_key);
             }
         } else {
             if (payload.graphics_key) {
-                SetGraphicsBuildState(*payload.graphics_key, PipelineBuildState::Failed);
+                mark_graphics_failed_if_tracked(*payload.graphics_key);
             }
         }
     }
@@ -510,40 +530,42 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.graphics_async_queue_hits;
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Queued);
+            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
             if (compile_queue) {
-                const auto depth_before = compile_queue->QueueDepth();
-                if (ShouldThrottleSyncFallback(depth_before)) {
+                auto observed_depth = 0u;
+                const auto queue_limit = AsyncQueueThrottleDepth();
+                const DeferredCompilePayload payload{
+                    .key_hash = pipeline_hash,
+                    .is_compute = false,
+                    .graphics_key = graphics_key,
+                    .compute_key = std::nullopt,
+                    .enqueued_ts_us =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                };
+                const auto budget_us = async_pso_soft_budget_us;
+                // Keep the throttle check and enqueue under the same queue lock so bursty misses
+                // cannot all observe the same stale low depth and overshoot the queue target.
+                const auto enqueue_result = compile_queue->TryEnqueue(
+                    [this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
+                    },
+                    queue_limit);
+                observed_depth = enqueue_result.queue_depth;
+                if (!enqueue_result.enqueued && observed_depth >= queue_limit) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.graphics_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = false,
-                        .graphics_key = graphics_key,
-                        .compute_key = std::nullopt,
-                        .enqueued_ts_us = static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(observed_depth);
             }
         }
 
         GraphicsPipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
         if (async_pso_requested) {
-            SetGraphicsBuildState(graphics_key, PipelineBuildState::Compiling);
             ++perf_counters.graphics_sync_fallbacks;
         }
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -609,40 +631,40 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         if (async_pso_requested) {
             ++perf_counters.compute_async_queue_hits;
-            SetComputeBuildState(compute_key, PipelineBuildState::Queued);
+            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
             if (compile_queue) {
-                const auto depth_before = compile_queue->QueueDepth();
-                if (ShouldThrottleSyncFallback(depth_before)) {
+                auto observed_depth = 0u;
+                const auto queue_limit = AsyncQueueThrottleDepth();
+                const DeferredCompilePayload payload{
+                    .key_hash = pipeline_hash,
+                    .is_compute = true,
+                    .graphics_key = std::nullopt,
+                    .compute_key = compute_key,
+                    .enqueued_ts_us =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()),
+                };
+                const auto budget_us = async_pso_soft_budget_us;
+                const auto enqueue_result = compile_queue->TryEnqueue(
+                    [this, payload, budget_us] {
+                        HandleDeferredCompilePayload(payload, budget_us);
+                    },
+                    queue_limit);
+                observed_depth = enqueue_result.queue_depth;
+                if (!enqueue_result.enqueued && observed_depth >= queue_limit) {
                     ++perf_counters.async_throttle_hits;
                     ++perf_counters.async_queue_enqueue_skips;
                     ++perf_counters.async_queue_budget_warnings;
                     ++perf_counters.compute_sync_fallbacks;
-                } else {
-                    const DeferredCompilePayload payload{
-                        .key_hash = pipeline_hash,
-                        .is_compute = true,
-                        .graphics_key = std::nullopt,
-                        .compute_key = compute_key,
-                        .enqueued_ts_us = static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count()),
-                    };
-                    const auto budget_us = async_pso_soft_budget_us;
-                    compile_queue->Enqueue([this, payload, budget_us] {
-                        HandleDeferredCompilePayload(payload, budget_us);
-                    });
                 }
-                perf_counters.async_queue_depth_peak = std::max<u64>(
-                    perf_counters.async_queue_depth_peak, compile_queue->QueueDepth());
-                perf_counters.async_queue_tasks_completed = compile_queue->CompletedTasks();
+                UpdateAsyncQueueObservability(observed_depth);
             }
         }
 
         ComputePipeline::SerializationSupport sdata{};
         const auto t0 = std::chrono::steady_clock::now();
         if (async_pso_requested) {
-            SetComputeBuildState(compute_key, PipelineBuildState::Compiling);
             ++perf_counters.compute_sync_fallbacks;
         }
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
